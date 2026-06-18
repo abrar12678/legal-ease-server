@@ -86,7 +86,7 @@ app.get("/", (req, res) => {
   res.send("LegalEase Backend is running!");
 });
 
-// ─── API: Get My Hirings (for User Dashboard & Hiring History) ──────
+// ─── API: Get My Hirings ─────────────────────────────────────────────
 // GET /api/hirings/my-hirings?limit=100
 app.get("/api/hirings/my-hirings", verifyUser, async (req, res) => {
   try {
@@ -238,6 +238,50 @@ app.delete("/api/comments/:id", verifyUser, async (req, res) => {
     return res
       .status(500)
       .json({ success: false, message: "Failed to delete comment" });
+  }
+});
+
+// ─── API: Update User Profile ────────────────────────────────────────
+// PUT /api/users/update-profile
+app.put("/api/users/update-profile", verifyUser, async (req, res) => {
+  try {
+    const { name, image } = req.body;
+
+    if (!name || !name.trim()) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Name is required" });
+    }
+
+    const updateFields = {
+      name: name.trim(),
+      updatedAt: new Date(),
+    };
+
+    if (image) {
+      updateFields.image = image;
+    }
+
+    const result = await db
+      .collection("user")
+      .updateOne({ _id: req.user._id }, { $set: updateFields });
+
+    if (result.matchedCount === 0) {
+      return res
+        .status(404)
+        .json({ success: false, message: "User not found" });
+    }
+
+    return res.json({
+      success: true,
+      message: "Profile updated",
+      data: { name: name.trim(), image: image || req.user.image },
+    });
+  } catch (err) {
+    console.error("Error updating profile:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to update profile" });
   }
 });
 
