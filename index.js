@@ -86,7 +86,7 @@ app.get("/", (req, res) => {
   res.send("LegalEase Backend is running!");
 });
 
-// ─── API: Get My Hirings ─────────────────────────────────────────────
+// ─── API: Get My Hirings (Client) ────────────────────────────────────
 // GET /api/hirings/my-hirings?limit=100
 app.get("/api/hirings/my-hirings", verifyUser, async (req, res) => {
   try {
@@ -136,6 +136,153 @@ app.get("/api/hirings/my-hirings", verifyUser, async (req, res) => {
     return res
       .status(500)
       .json({ success: false, message: "Failed to fetch hirings" });
+  }
+});
+
+// ─── API: Get Lawyer Requests ────────────────────────────────────────
+// GET /api/hirings/lawyer-requests
+app.get("/api/hirings/lawyer-requests", verifyUser, async (req, res) => {
+  try {
+    const hirings = await db
+      .collection("hiring")
+      .find({ lawyerId: req.user._id.toString() })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const enriched = await Promise.all(
+      hirings.map(async (hiring) => {
+        let clientName = "Unknown";
+
+        if (hiring.userId) {
+          const client = await db
+            .collection("user")
+            .findOne(
+              { _id: new ObjectId(hiring.userId) },
+              { projection: { name: 1 } },
+            );
+          if (client) {
+            clientName = client.name || "Unknown";
+          }
+        }
+
+        return {
+          _id: hiring._id,
+          userId: hiring.userId,
+          lawyerId: hiring.lawyerId,
+          clientName,
+          budget: hiring.budget || 0,
+          status: hiring.status || "pending",
+          createdAt: hiring.createdAt,
+        };
+      }),
+    );
+
+    return res.json({ success: true, data: { hirings: enriched } });
+  } catch (err) {
+    console.error("Error fetching lawyer requests:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch requests" });
+  }
+});
+
+// ─── API: Accept / Reject Hiring Request ─────────────────────────────
+// PATCH /api/hirings/:id/accept   or   PATCH /api/hirings/:id/reject
+app.patch("/api/hirings/:id/:action", verifyUser, async (req, res) => {
+  try {
+    const { id, action } = req.params;
+
+    if (action !== "accept" && action !== "reject") {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid action. Use 'accept' or 'reject'.",
+      });
+    }
+
+    const newStatus = action === "accept" ? "accepted" : "rejected";
+
+    const result = await db.collection("hiring").updateOne(
+      {
+        _id: new ObjectId(id),
+        lawyerId: req.user._id.toString(),
+        status: "pending",
+      },
+      { $set: { status: newStatus, updatedAt: new Date() } },
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Request not found or already acted on",
+      });
+    }
+
+    return res.json({ success: true, message: `Request ${newStatus}` });
+  } catch (err) {
+    console.error(`Error ${req.params.action}ing request:`, err);
+    return res.status(500).json({
+      success: false,
+      message: `Failed to ${req.params.action} request`,
+    });
+  }
+});
+
+// ─── API: Get Lawyer Profile ─────────────────────────────────────────
+// GET /api/lawyers/profile
+app.get("/api/lawyers/profile", verifyUser, async (req, res) => {
+  try {
+    const user = await db.collection("user").findOne(
+      { _id: req.user._id },
+      {
+        projection: {
+          name: 1,
+          email: 1,
+          image: 1,
+          specialization: 1,
+          bio: 1,
+          fee: 1,
+          isAvailable: 1,
+          createdAt: 1,
+        },
+      },
+    );
+
+    if (!user) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Profile not found" });
+    }
+
+    // Get rating and review count from comments
+    const reviewStats = await db
+      .collection("comment")
+      .aggregate([
+        { $match: { lawyerId: req.user._id.toString() } },
+        {
+          $group: {
+            _id: null,
+            avgRating: { $avg: "$rating" },
+            total: { $sum: 1 },
+          },
+        },
+      ])
+      .toArray();
+
+    return res.json({
+      success: true,
+      data: {
+        ...user,
+        rating: reviewStats[0]?.avgRating
+          ? Number(reviewStats[0].avgRating.toFixed(1))
+          : 0,
+        totalReviews: reviewStats[0]?.total || 0,
+      },
+    });
+  } catch (err) {
+    console.error("Error fetching lawyer profile:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch profile" });
   }
 });
 
