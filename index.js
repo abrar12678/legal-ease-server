@@ -240,6 +240,15 @@ app.get("/api/lawyers/profile", verifyUser, async (req, res) => {
           image: 1,
           specialization: 1,
           bio: 1,
+          hourlyRate: 1,
+          phone: 1,
+          barLicenseNumber: 1,
+          experience: 1,
+          education: 1,
+          languages: 1,
+          location: 1,
+          city: 1,
+          achievements: 1,
           fee: 1,
           isAvailable: 1,
           createdAt: 1,
@@ -253,7 +262,6 @@ app.get("/api/lawyers/profile", verifyUser, async (req, res) => {
         .json({ success: false, message: "Profile not found" });
     }
 
-    // Get rating and review count from comments
     const reviewStats = await db
       .collection("comment")
       .aggregate([
@@ -283,6 +291,81 @@ app.get("/api/lawyers/profile", verifyUser, async (req, res) => {
     return res
       .status(500)
       .json({ success: false, message: "Failed to fetch profile" });
+  }
+});
+
+// ─── API: Update Lawyer Profile ──────────────────────────────────────
+// PUT /api/lawyers/profile
+app.put("/api/lawyers/profile", verifyUser, async (req, res) => {
+  try {
+    const {
+      name,
+      image,
+      specialization,
+      bio,
+      hourlyRate,
+      phone,
+      barLicenseNumber,
+      experience,
+      education,
+      languages,
+      location,
+      city,
+      achievements,
+    } = req.body;
+
+    if (!name || !name.trim()) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Name is required" });
+    }
+
+    const updateFields = {
+      name: name.trim(),
+      updatedAt: new Date(),
+    };
+
+    if (image !== undefined) updateFields.image = image;
+    if (specialization !== undefined)
+      updateFields.specialization = specialization;
+    if (bio !== undefined) updateFields.bio = bio;
+    if (hourlyRate !== undefined)
+      updateFields.hourlyRate = Number(hourlyRate) || 0;
+    if (phone !== undefined) updateFields.phone = phone;
+    if (barLicenseNumber !== undefined)
+      updateFields.barLicenseNumber = barLicenseNumber;
+    if (experience !== undefined)
+      updateFields.experience = Number(experience) || 0;
+    if (education !== undefined)
+      updateFields.education = Array.isArray(education) ? education : [];
+    if (languages !== undefined)
+      updateFields.languages = Array.isArray(languages) ? languages : [];
+    if (location !== undefined) updateFields.location = location;
+    if (city !== undefined) updateFields.city = city;
+    if (achievements !== undefined)
+      updateFields.achievements = Array.isArray(achievements)
+        ? achievements
+        : [];
+
+    const result = await db
+      .collection("user")
+      .updateOne({ _id: req.user._id }, { $set: updateFields });
+
+    if (result.matchedCount === 0) {
+      return res
+        .status(404)
+        .json({ success: false, message: "User not found" });
+    }
+
+    return res.json({
+      success: true,
+      message: "Profile updated successfully",
+    });
+  } catch (err) {
+    console.error("Error updating lawyer profile:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to update profile" });
   }
 });
 
@@ -388,7 +471,7 @@ app.delete("/api/comments/:id", verifyUser, async (req, res) => {
   }
 });
 
-// ─── API: Update User Profile ────────────────────────────────────────
+// ─── API: Update User Profile (Client) ───────────────────────────────
 // PUT /api/users/update-profile
 app.put("/api/users/update-profile", verifyUser, async (req, res) => {
   try {
