@@ -81,6 +81,16 @@ async function verifyUser(req, res, next) {
   }
 }
 
+// ─── Admin Middleware ─────────────────────────────────────────────────
+function verifyAdmin(req, res, next) {
+  if (req.user.role !== "admin") {
+    return res
+      .status(403)
+      .json({ success: false, message: "Forbidden: Admin access required" });
+  }
+  next();
+}
+
 // ─── Health Check ────────────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.send("LegalEase Backend is running!");
@@ -512,6 +522,408 @@ app.put("/api/users/update-profile", verifyUser, async (req, res) => {
     return res
       .status(500)
       .json({ success: false, message: "Failed to update profile" });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// ADMIN ROUTES
+// ═══════════════════════════════════════════════════════════════════════
+
+// ─── API: Get All Users (Admin) ──────────────────────────────────────
+// GET /api/admin/users
+app.get("/api/admin/users", verifyUser, verifyAdmin, async (req, res) => {
+  try {
+    const users = await db
+      .collection("user")
+      .find({})
+      .sort({ createdAt: -1 })
+      .project({
+        name: 1,
+        email: 1,
+        role: 1,
+        isBlocked: 1,
+        image: 1,
+        createdAt: 1,
+      })
+      .toArray();
+
+    const roleCounts = { client: 0, lawyer: 0, admin: 0 };
+    users.forEach((u) => {
+      const r = u.role === "user" ? "client" : u.role;
+      if (roleCounts[r] !== undefined) roleCounts[r]++;
+    });
+
+    return res.json({
+      success: true,
+      data: { users, roleCounts },
+    });
+  } catch (err) {
+    console.error("Error fetching users:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch users" });
+  }
+});
+
+// ─── API: Block / Unblock User (Admin) ───────────────────────────────
+// PATCH /api/admin/users/:id/block
+app.patch(
+  "/api/admin/users/:id/block",
+  verifyUser,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const { isBlocked } = req.body;
+      const userId = req.params.id;
+
+      if (userId === req.user._id.toString()) {
+        return res
+          .status(400)
+          .json({ success: false, message: "You cannot block yourself" });
+      }
+
+      const targetUser = await db
+        .collection("user")
+        .findOne({ _id: new ObjectId(userId) });
+      if (!targetUser) {
+        return res
+          .status(404)
+          .json({ success: false, message: "User not found" });
+      }
+      if (targetUser.role === "admin") {
+        return res
+          .status(400)
+          .json({ success: false, message: "Cannot block an admin" });
+      }
+
+      await db
+        .collection("user")
+        .updateOne(
+          { _id: new ObjectId(userId) },
+          { $set: { isBlocked: !!isBlocked, updatedAt: new Date() } },
+        );
+
+      return res.json({
+        success: true,
+        message: `User ${isBlocked ? "blocked" : "unblocked"}`,
+      });
+    } catch (err) {
+      console.error("Error blocking user:", err);
+      return res
+        .status(500)
+        .json({ success: false, message: "Failed to update user" });
+    }
+  },
+);
+
+// ─── API: Change User Role (Admin) ───────────────────────────────────
+// PATCH /api/admin/users/:id/role
+app.patch(
+  "/api/admin/users/:id/role",
+  verifyUser,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const { role } = req.body;
+      const userId = req.params.id;
+
+      if (!["client", "lawyer", "admin"].includes(role)) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid role" });
+      }
+
+      if (userId === req.user._id.toString()) {
+        return res
+          .status(400)
+          .json({ success: false, message: "You cannot change your own role" });
+      }
+
+      const result = await db
+        .collection("user")
+        .updateOne(
+          { _id: new ObjectId(userId) },
+          { $set: { role, updatedAt: new Date() } },
+        );
+
+      if (result.matchedCount === 0) {
+        return res
+          .status(404)
+          .json({ success: false, message: "User not found" });
+      }
+
+      return res.json({
+        success: true,
+        message: `Role updated to ${role}`,
+      });
+    } catch (err) {
+      console.error("Error changing role:", err);
+      return res
+        .status(500)
+        .json({ success: false, message: "Failed to change role" });
+    }
+  },
+);
+
+// ─── API: Delete User (Admin) ────────────────────────────────────────
+// DELETE /api/admin/users/:id
+app.delete(
+  "/api/admin/users/:id",
+  verifyUser,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const userId = req.params.id;
+
+      if (userId === req.user._id.toString()) {
+        return res
+          .status(400)
+          .json({ success: false, message: "You cannot delete yourself" });
+      }
+
+      const oid = new ObjectId(userId);
+      await db.collection("session").deleteMany({ userId });
+      await db.collection("comment").deleteMany({ userId });
+      await db.collection("hiring").deleteMany({ userId });
+      await db.collection("hiring").deleteMany({ lawyerId: userId });
+
+      const result = await db.collection("user").deleteOne({ _id: oid });
+
+      if (result.deletedCount === 0) {
+        return res
+          .status(404)
+          .json({ success: false, message: "User not found" });
+      }
+
+      return res.json({
+        success: true,
+        message: "User deleted successfully",
+      });
+    } catch (err) {
+      console.error("Error deleting user:", err);
+      return res
+        .status(500)
+        .json({ success: false, message: "Failed to delete user" });
+    }
+  },
+);
+
+// ─── API: Get All Transactions (Admin) ───────────────────────────────
+// GET /api/admin/transactions?status=all|completed|pending|failed
+app.get(
+  "/api/admin/transactions",
+  verifyUser,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const { status } = req.query;
+
+      const filter = {};
+      if (status && status !== "all") {
+        const statusMap = {
+          completed: "accepted",
+          pending: "pending",
+          failed: "rejected",
+        };
+        filter.status = statusMap[status] || status;
+      }
+
+      const hirings = await db
+        .collection("hiring")
+        .find(filter)
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      const transactions = await Promise.all(
+        hirings.map(async (hiring) => {
+          let clientEmail = "N/A";
+          let lawyerEmail = "N/A";
+
+          if (hiring.userId) {
+            const client = await db
+              .collection("user")
+              .findOne(
+                { _id: new ObjectId(hiring.userId) },
+                { projection: { email: 1 } },
+              );
+            if (client) clientEmail = client.email;
+          }
+
+          if (hiring.lawyerId) {
+            const lawyer = await db
+              .collection("user")
+              .findOne(
+                { _id: new ObjectId(hiring.lawyerId) },
+                { projection: { email: 1 } },
+              );
+            if (lawyer) lawyerEmail = lawyer.email;
+          }
+
+          let txnStatus = "pending";
+          if (hiring.status === "accepted") txnStatus = "completed";
+          else if (hiring.status === "rejected") txnStatus = "failed";
+
+          return {
+            transactionId: hiring._id.toString(),
+            clientEmail,
+            lawyerEmail,
+            amount: hiring.budget || 0,
+            status: txnStatus,
+            createdAt: hiring.createdAt,
+          };
+        }),
+      );
+
+      const totalAmount = transactions
+        .filter((t) => t.status === "completed")
+        .reduce((sum, t) => sum + t.amount, 0);
+
+      return res.json({
+        success: true,
+        data: { transactions, totalAmount },
+      });
+    } catch (err) {
+      console.error("Error fetching transactions:", err);
+      return res
+        .status(500)
+        .json({ success: false, message: "Failed to fetch transactions" });
+    }
+  },
+);
+
+// ─── API: Get Admin Stats (Admin) ────────────────────────────────────
+// GET /api/admin/stats
+// Used by: Admin Dashboard + Analytics page (top cards)
+app.get("/api/admin/stats", verifyUser, verifyAdmin, async (req, res) => {
+  try {
+    const [totalUsers, totalLawyers, totalHires, acceptedHires] =
+      await Promise.all([
+        db.collection("user").countDocuments({}),
+        db.collection("user").countDocuments({ role: { $in: ["lawyer"] } }),
+        db.collection("hiring").countDocuments({}),
+        db.collection("hiring").countDocuments({ status: "accepted" }),
+      ]);
+
+    // Revenue = sum of budget from accepted hirings
+    const revenueAgg = await db
+      .collection("hiring")
+      .aggregate([
+        { $match: { status: "accepted" } },
+        { $group: { _id: null, total: { $sum: "$budget" } } },
+      ])
+      .toArray();
+    const totalRevenue = revenueAgg[0]?.total || 0;
+
+    return res.json({
+      success: true,
+      data: {
+        totalUsers,
+        totalLawyers,
+        totalHires,
+        totalRevenue,
+      },
+    });
+  } catch (err) {
+    console.error("Error fetching admin stats:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch stats" });
+  }
+});
+
+// ─── API: Get Admin Analytics (Admin) ────────────────────────────────
+// GET /api/admin/analytics
+// Returns: monthlyUsers, monthlyHires, monthlyRevenue (last 6 months),
+//          topSpecializations, recentActivity
+app.get("/api/admin/analytics", verifyUser, verifyAdmin, async (req, res) => {
+  try {
+    const now = new Date();
+    const months = [];
+
+    // Generate last 6 months
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const start = new Date(d.getFullYear(), d.getMonth(), 1);
+      const end = new Date(d.getFullYear(), d.getMonth() + 1, 1);
+      const label = d.toLocaleDateString("en-US", {
+        month: "short",
+        year: "2-digit",
+      });
+      months.push({ start, end, month: label });
+    }
+
+    // Monthly users, hires, revenue
+    const monthlyUsers = await Promise.all(
+      months.map(async (m) => {
+        const count = await db.collection("user").countDocuments({
+          createdAt: { $gte: m.start, $lt: m.end },
+        });
+        return { month: m.month, value: count };
+      }),
+    );
+
+    const monthlyHires = await Promise.all(
+      months.map(async (m) => {
+        const count = await db.collection("hiring").countDocuments({
+          createdAt: { $gte: m.start, $lt: m.end },
+        });
+        return { month: m.month, value: count };
+      }),
+    );
+
+    const monthlyRevenue = await Promise.all(
+      months.map(async (m) => {
+        const agg = await db
+          .collection("hiring")
+          .aggregate([
+            {
+              $match: {
+                status: "accepted",
+                createdAt: { $gte: m.start, $lt: m.end },
+              },
+            },
+            { $group: { _id: null, total: { $sum: "$budget" } } },
+          ])
+          .toArray();
+        return { month: m.month, value: agg[0]?.total || 0 };
+      }),
+    );
+
+    // Top specializations (from lawyer users)
+    const topSpecs = await db
+      .collection("user")
+      .aggregate([
+        {
+          $match: {
+            role: "lawyer",
+            specialization: { $exists: true, $ne: "" },
+          },
+        },
+        { $group: { _id: "$specialization", count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+        { $limit: 8 },
+      ])
+      .toArray();
+
+    const topSpecializations = topSpecs.map((s) => ({
+      name: s._id || "Other",
+      count: s.count,
+    }));
+
+    return res.json({
+      success: true,
+      data: {
+        monthlyUsers,
+        monthlyHires,
+        monthlyRevenue,
+        topSpecializations,
+      },
+    });
+  } catch (err) {
+    console.error("Error fetching analytics:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch analytics" });
   }
 });
 
