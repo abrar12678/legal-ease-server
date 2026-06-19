@@ -6,6 +6,9 @@ require("dotenv").config();
 
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 
+// ─── Stripe (Option 2: Checkout Sessions — No Webhook) ─────────────
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+
 // ─── Middleware ───────────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json());
@@ -68,6 +71,15 @@ async function verifyUser(req, res, next) {
       return res
         .status(401)
         .json({ success: false, message: "Unauthorized: User not found" });
+    }
+
+    // Check if user is blocked
+    if (user.isBlocked) {
+      await db.collection("session").deleteOne({ _id: session._id });
+      return res.status(403).json({
+        success: false,
+        message: "Forbidden: Your account has been blocked. Contact an administrator.",
+      });
     }
 
     req.user = user;
@@ -664,10 +676,83 @@ app.get("/api/hirings/lawyer-requests", verifyUser, async (req, res) => {
   }
 });
 
+// ─── API: Create Hiring Request (Client) ────────────────────────────
+// POST /api/hirings
+app.post("/api/hirings", verifyUser, async (req, res) => {
+  try {
+    const { lawyerId, budget } = req.body;
+
+    if (req.user.role !== "user") {
+      return res
+        .status(403)
+        .json({ success: false, message: "Only clients can hire lawyers" });
+    }
+
+    if (!lawyerId) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Lawyer ID is required" });
+    }
+
+    const lawyer = await db.collection("user").findOne({
+      _id: new ObjectId(lawyerId),
+      role: "lawyer",
+    });
+
+    if (!lawyer) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Lawyer not found" });
+    }
+
+    const existing = await db.collection("hiring").findOne({
+      userId: req.user._id.toString(),
+      lawyerId: lawyerId,
+      status: { $in: ["pending", "accepted"] },
+    });
+
+    if (existing) {
+      return res.status(400).json({
+        success: false,
+        message: "You already have an active hiring request with this lawyer",
+      });
+    }
+
+    const hiring = {
+      userId: req.user._id.toString(),
+      lawyerId: lawyerId,
+      budget: budget || lawyer.hourlyRate || 0,
+      status: "pending",
+      createdAt: new Date(),
+    };
+
+    const result = await db.collection("hiring").insertOne(hiring);
+
+    return res.json({
+      success: true,
+      message: "Hiring request sent successfully",
+      data: { _id: result.insertedId },
+    });
+  } catch (err) {
+    console.error("Error creating hiring:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to create hiring request" });
+  }
+});
+
 // ─── API: Accept / Reject Hiring Request ─────────────────────────────
 // PATCH /api/hirings/:id/accept   or   PATCH /api/hirings/:id/reject
 app.patch("/api/hirings/:id/:action", verifyUser, async (req, res) => {
   try {
+    // Role check: only lawyers can accept/reject
+    if (req.user.role !== "lawyer") {
+      return res.status(403).json({
+        success: false,
+        message: "Forbidden: Only lawyers can accept or reject hiring requests",
+      });
+    }
+
     const { id, action } = req.params;
 
     if (action !== "accept" && action !== "reject") {
@@ -705,10 +790,152 @@ app.patch("/api/hirings/:id/:action", verifyUser, async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════
+// PAYMENT ROUTES (Stripe Checkout Sessions — No Webhook Needed)
+// ═══════════════════════════════════════════════════════════════════════
+
+// ─── API: Create Stripe Checkout Session ─────────────────────────────
+// POST /api/payments/create-checkout
+app.post("/api/payments/create-checkout", verifyUser, async (req, res) => {
+  try {
+    const { hiringId } = req.body;
+
+    if (!hiringId) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Hiring ID is required" });
+    }
+
+    const hiring = await db.collection("hiring").findOne({
+      _id: new ObjectId(hiringId),
+      userId: req.user._id.toString(),
+      status: "accepted",
+    });
+
+    if (!hiring) {
+      return res.status(404).json({
+        success: false,
+        message: "Hiring not found or not eligible for payment",
+      });
+    }
+
+    if (!hiring.budget || hiring.budget <= 0) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid payment amount" });
+    }
+
+    const lawyer = hiring.lawyerId
+      ? await db
+          .collection("user")
+          .findOne(
+            { _id: new ObjectId(hiring.lawyerId) },
+            { projection: { name: 1 } },
+          )
+      : null;
+
+    const lawyerName = lawyer?.name || "Lawyer";
+    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ["card"],
+      line_items: [
+        {
+          price_data: {
+            currency: "usd",
+            product_data: {
+              name: `Legal Consultation — ${lawyerName}`,
+              description: `Hiring ID: ${hiringId}`,
+            },
+            unit_amount: Math.round(hiring.budget * 100),
+          },
+          quantity: 1,
+        },
+      ],
+      mode: "payment",
+      success_url: `${frontendUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${frontendUrl}/dashboard/user/hiring-history`,
+      client_reference_id: hiringId,
+      metadata: {
+        hiringId: hiringId,
+        userId: req.user._id.toString(),
+        lawyerId: hiring.lawyerId || "",
+      },
+    });
+
+    return res.json({
+      success: true,
+      data: { url: session.url, sessionId: session.id },
+    });
+  } catch (err) {
+    console.error("Error creating checkout session:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to create checkout session" });
+  }
+});
+
+// ─── API: Verify Payment Status ──────────────────────────────────────
+// GET /api/payments/status/:sessionId
+app.get("/api/payments/status/:sessionId", verifyUser, async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+    if (session.payment_status === "paid") {
+      const hiringId = session.metadata?.hiringId;
+      if (hiringId) {
+        await db.collection("hiring").updateOne(
+          { _id: new ObjectId(hiringId), userId: req.user._id.toString() },
+          {
+            $set: {
+              status: "paid",
+              paidAt: new Date(),
+              stripeSessionId: sessionId,
+              updatedAt: new Date(),
+            },
+          },
+        );
+      }
+
+      return res.json({
+        success: true,
+        data: {
+          status: "paid",
+          stripePaymentStatus: session.payment_status,
+          amount: session.amount_total / 100,
+        },
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: {
+        status: session.payment_status,
+        stripePaymentStatus: session.payment_status,
+      },
+    });
+  } catch (err) {
+    console.error("Error verifying payment:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to verify payment" });
+  }
+});
+
 // ─── API: Get Lawyer Profile ─────────────────────────────────────────
 // GET /api/lawyers/profile
 app.get("/api/lawyers/profile", verifyUser, async (req, res) => {
   try {
+    // Role check: only lawyers
+    if (req.user.role !== "lawyer") {
+      return res.status(403).json({
+        success: false,
+        message: "Forbidden: This endpoint is for lawyers only",
+      });
+    }
+
     const user = await db.collection("user").findOne(
       { _id: req.user._id },
       {
@@ -776,6 +1003,14 @@ app.get("/api/lawyers/profile", verifyUser, async (req, res) => {
 // PUT /api/lawyers/profile
 app.put("/api/lawyers/profile", verifyUser, async (req, res) => {
   try {
+    // Role check: only lawyers
+    if (req.user.role !== "lawyer") {
+      return res.status(403).json({
+        success: false,
+        message: "Forbidden: This endpoint is for lawyers only",
+      });
+    }
+
     const {
       name,
       image,
@@ -892,6 +1127,19 @@ app.post("/api/comments", verifyUser, async (req, res) => {
       return res.status(409).json({
         success: false,
         message: "You have already reviewed this lawyer",
+      });
+    }
+
+    // Check if user has hired this lawyer (accepted or paid)
+    const hiringRecord = await db.collection("hiring").findOne({
+      userId: req.user._id.toString(),
+      lawyerId,
+      status: { $in: ["accepted", "paid"] },
+    });
+    if (!hiringRecord) {
+      return res.status(403).json({
+        success: false,
+        message: "Only clients who have hired this lawyer can leave a review",
       });
     }
 
@@ -1065,6 +1313,164 @@ app.put("/api/users/update-profile", verifyUser, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════
+// LAWYER SERVICES CRUD (Lawyer only)
+// ═══════════════════════════════════════════════════════════════════════
+
+// ─── API: Get Lawyer Services ──────────────────────────────────────
+// GET /api/lawyers/services
+app.get("/api/lawyers/services", verifyUser, async (req, res) => {
+  try {
+    if (req.user.role !== "lawyer") {
+      return res.status(403).json({
+        success: false,
+        message: "Forbidden: This endpoint is for lawyers only",
+      });
+    }
+
+    const services = await db
+      .collection("service")
+      .find({ lawyerId: req.user._id.toString() })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    return res.json({ success: true, data: services });
+  } catch (err) {
+    console.error("Error fetching lawyer services:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch services" });
+  }
+});
+
+// ─── API: Create a Service ─────────────────────────────────────────
+// POST /api/lawyers/services
+app.post("/api/lawyers/services", verifyUser, async (req, res) => {
+  try {
+    if (req.user.role !== "lawyer") {
+      return res.status(403).json({
+        success: false,
+        message: "Forbidden: Only lawyers can create services",
+      });
+    }
+
+    const { name, description, fee, specialization } = req.body;
+
+    if (!name || !name.trim()) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Service name is required" });
+    }
+
+    const service = {
+      lawyerId: req.user._id.toString(),
+      name: name.trim(),
+      description: (description || "").trim(),
+      fee: Number(fee) || 0,
+      specialization: specialization || "Criminal Law",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await db.collection("service").insertOne(service);
+
+    return res.status(201).json({
+      success: true,
+      message: "Service created successfully",
+      data: { _id: result.insertedId, ...service },
+    });
+  } catch (err) {
+    console.error("Error creating service:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to create service" });
+  }
+});
+
+// ─── API: Update a Service ─────────────────────────────────────────
+// PUT /api/lawyers/services/:id
+app.put("/api/lawyers/services/:id", verifyUser, async (req, res) => {
+  try {
+    if (req.user.role !== "lawyer") {
+      return res.status(403).json({
+        success: false,
+        message: "Forbidden: Only lawyers can update services",
+      });
+    }
+
+    const { name, description, fee, specialization } = req.body;
+    const serviceId = req.params.id;
+
+    const existing = await db.collection("service").findOne({
+      _id: new ObjectId(serviceId),
+      lawyerId: req.user._id.toString(),
+    });
+
+    if (!existing) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Service not found" });
+    }
+
+    const updateFields = { updatedAt: new Date() };
+    if (name !== undefined) updateFields.name = name.trim();
+    if (description !== undefined) updateFields.description = description.trim();
+    if (fee !== undefined) updateFields.fee = Number(fee) || 0;
+    if (specialization !== undefined) updateFields.specialization = specialization;
+
+    await db
+      .collection("service")
+      .updateOne(
+        { _id: new ObjectId(serviceId) },
+        { $set: updateFields },
+      );
+
+    return res.json({
+      success: true,
+      message: "Service updated successfully",
+    });
+  } catch (err) {
+    console.error("Error updating service:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to update service" });
+  }
+});
+
+// ─── API: Delete a Service ─────────────────────────────────────────
+// DELETE /api/lawyers/services/:id
+app.delete("/api/lawyers/services/:id", verifyUser, async (req, res) => {
+  try {
+    if (req.user.role !== "lawyer") {
+      return res.status(403).json({
+        success: false,
+        message: "Forbidden: Only lawyers can delete services",
+      });
+    }
+
+    const result = await db.collection("service").deleteOne({
+      _id: new ObjectId(req.params.id),
+      lawyerId: req.user._id.toString(),
+    });
+
+    if (result.deletedCount === 0) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Service not found" });
+    }
+
+    return res.json({
+      success: true,
+      message: "Service deleted successfully",
+    });
+  } catch (err) {
+    console.error("Error deleting service:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to delete service" });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
 // ADMIN ROUTES
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -1166,7 +1572,7 @@ app.patch(
       const { role } = req.body;
       const userId = req.params.id;
 
-      if (!["client", "lawyer", "admin"].includes(role)) {
+      if (!["user", "client", "lawyer", "admin"].includes(role)) {
         return res
           .status(400)
           .json({ success: false, message: "Invalid role" });
@@ -1260,7 +1666,7 @@ app.get(
       const filter = {};
       if (status && status !== "all") {
         const statusMap = {
-          completed: "accepted",
+          completed: "paid",
           pending: "pending",
           failed: "rejected",
         };
@@ -1299,7 +1705,8 @@ app.get(
           }
 
           let txnStatus = "pending";
-          if (hiring.status === "accepted") txnStatus = "completed";
+          if (hiring.status === "paid")
+            txnStatus = "completed";
           else if (hiring.status === "rejected") txnStatus = "failed";
 
           return {
@@ -1345,7 +1752,7 @@ app.get("/api/admin/stats", verifyUser, verifyAdmin, async (req, res) => {
     const revenueAgg = await db
       .collection("hiring")
       .aggregate([
-        { $match: { status: "accepted" } },
+        { $match: { status: "paid" } },
         { $group: { _id: null, total: { $sum: "$budget" } } },
       ])
       .toArray();
@@ -1411,7 +1818,7 @@ app.get("/api/admin/analytics", verifyUser, verifyAdmin, async (req, res) => {
           .aggregate([
             {
               $match: {
-                status: "accepted",
+                status: "paid",
                 createdAt: { $gte: m.start, $lt: m.end },
               },
             },
