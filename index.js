@@ -9,6 +9,32 @@ const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 // ─── Stripe (Option 2: Checkout Sessions — No Webhook) ─────────────
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 
+// ─── Nodemailer (Dummy Transport for Email Notifications) ───────────
+const nodemailer = require("nodemailer");
+
+// Create a test account (ethereal.email) for dummy email transport
+let dummyTransporter = null;
+let dummyEmailAccount = null;
+
+async function initDummyEmail() {
+  try {
+    dummyEmailAccount = await nodemailer.createTestAccount();
+    dummyTransporter = nodemailer.createTransport({
+      host: "smtp.ethereal.email",
+      port: 587,
+      secure: false,
+      auth: {
+        user: dummyEmailAccount.user,
+        pass: dummyEmailAccount.pass,
+      },
+    });
+    console.log("📧 Dummy Email transport initialized");
+  } catch (err) {
+    console.warn("⚠️  Dummy Email transport failed to init, falling back to console logging:", err.message);
+  }
+}
+initDummyEmail();
+
 // ─── Middleware ───────────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json());
@@ -259,6 +285,42 @@ app.get("/api/lawyers", async (req, res) => {
       location: l.city || l.location || "",
     }));
 
+    // ── Optional: enrich with isHired & isShortlisted for logged-in users ──
+    // The auth header may be present from apiFetch, try to decode user
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+      try {
+        const token = authHeader.split(" ")[1];
+        const session = await db.collection("session").findOne({ token });
+        if (session && !session.expiresAt || new Date(session.expiresAt) >= new Date()) {
+          const userId = session.userId.toString();
+          const lawyerIds = lawyers.map((l) => l.id);
+
+          // Check hired (accepted or paid)
+          const hirings = await db.collection("hiring").find({
+            userId,
+            lawyerId: { $in: lawyerIds },
+            status: { $in: ["accepted", "paid"] },
+          }).toArray();
+          const hiredSet = new Set(hirings.map((h) => h.lawyerId));
+
+          // Check shortlisted
+          const shortlisted = await db.collection("shortlist").find({
+            userId,
+            lawyerId: { $in: lawyerIds },
+          }).toArray();
+          const shortlistSet = new Set(shortlisted.map((s) => s.lawyerId));
+
+          lawyers.forEach((l) => {
+            l.isHired = hiredSet.has(l.id);
+            l.isShortlisted = shortlistSet.has(l.id);
+          });
+        }
+      } catch {
+        // silently ignore — public browsing still works
+      }
+    }
+
     return res.json({
       success: true,
       data: { lawyers, total },
@@ -433,149 +495,6 @@ app.get("/api/lawyers/categories", async (req, res) => {
   }
 });
 
-// ─── API: Get Lawyer Details (Public) ────────────────────────────────
-// GET /api/lawyers/:id
-// Returns lawyer profile, review stats, total hires, and comments
-app.get("/api/lawyers/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    if (!ObjectId.isValid(id)) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Invalid lawyer ID" });
-    }
-
-    // Fetch lawyer profile
-    const lawyer = await db.collection("user").findOne(
-      { _id: new ObjectId(id), role: "lawyer" },
-      {
-        projection: {
-          name: 1,
-          image: 1,
-          specialization: 1,
-          bio: 1,
-          hourlyRate: 1,
-          phone: 1,
-          barLicenseNumber: 1,
-          experience: 1,
-          education: 1,
-          languages: 1,
-          location: 1,
-          city: 1,
-          achievements: 1,
-          isAvailable: 1,
-          createdAt: 1,
-        },
-      },
-    );
-
-    if (!lawyer) {
-      return res
-        .status(404)
-        .json({ success: false, message: "Lawyer not found" });
-    }
-
-    // Get review stats
-    const reviewStats = await db
-      .collection("comment")
-      .aggregate([
-        { $match: { lawyerId: id } },
-        {
-          $group: {
-            _id: null,
-            avgRating: { $avg: "$rating" },
-            totalReviews: { $sum: 1 },
-          },
-        },
-      ])
-      .toArray();
-
-    // Get total hires count (accepted only)
-    const totalHires = await db.collection("hiring").countDocuments({
-      lawyerId: id,
-      status: "accepted",
-    });
-
-    // Get comments with commenter names
-    const comments = await db
-      .collection("comment")
-      .find({ lawyerId: id })
-      .sort({ createdAt: -1 })
-      .toArray();
-
-    const enrichedComments = await Promise.all(
-      comments.map(async (comment) => {
-        let userName = "Unknown";
-        let userImage = null;
-
-        if (comment.userId) {
-          try {
-            const commenter = await db
-              .collection("user")
-              .findOne(
-                { _id: new ObjectId(comment.userId) },
-                { projection: { name: 1, image: 1 } },
-              );
-            if (commenter) {
-              userName = commenter.name || "Unknown";
-              userImage = commenter.image || null;
-            }
-          } catch {
-            // invalid userId, skip
-          }
-        }
-
-        return {
-          _id: comment._id.toString(),
-          userId: comment.userId,
-          userName,
-          userImage,
-          text: comment.text || "",
-          rating: comment.rating || 0,
-          date: comment.createdAt,
-        };
-      }),
-    );
-
-    return res.json({
-      success: true,
-      data: {
-        lawyer: {
-          id: lawyer._id.toString(),
-          name: lawyer.name,
-          image: lawyer.image,
-          specialization: lawyer.specialization,
-          bio: lawyer.bio,
-          hourlyRate: lawyer.hourlyRate || 0,
-          phone: lawyer.phone,
-          barLicenseNumber: lawyer.barLicenseNumber,
-          experience: lawyer.experience || 0,
-          education: lawyer.education || [],
-          languages: lawyer.languages || [],
-          city: lawyer.city || lawyer.location || "",
-          location: lawyer.location || lawyer.city || "",
-          achievements: lawyer.achievements || [],
-          isAvailable: lawyer.isAvailable !== false,
-          status: lawyer.isAvailable === false ? "busy" : "available",
-          dateJoined: lawyer.createdAt,
-          rating: reviewStats[0]?.avgRating
-            ? Number(reviewStats[0].avgRating.toFixed(1))
-            : 0,
-          reviews: reviewStats[0]?.totalReviews || 0,
-          totalHires,
-        },
-        comments: enrichedComments,
-      },
-    });
-  } catch (err) {
-    console.error("Error fetching lawyer details:", err);
-    return res
-      .status(500)
-      .json({ success: false, message: "Failed to fetch lawyer details" });
-  }
-});
-
 // ─── API: Get My Hirings (Client) ────────────────────────────────────
 // GET /api/hirings/my-hirings?limit=100
 app.get("/api/hirings/my-hirings", verifyUser, async (req, res) => {
@@ -682,7 +601,7 @@ app.post("/api/hirings", verifyUser, async (req, res) => {
   try {
     const { lawyerId, budget } = req.body;
 
-    if (req.user.role !== "user") {
+    if (req.user.role !== "client") {
       return res
         .status(403)
         .json({ success: false, message: "Only clients can hire lawyers" });
@@ -727,6 +646,13 @@ app.post("/api/hirings", verifyUser, async (req, res) => {
     };
 
     const result = await db.collection("hiring").insertOne(hiring);
+
+    // ── Dummy Email Notification ──
+    sendDummyEmail({
+      to: lawyer.email,
+      subject: `New Hiring Request from ${req.user.name}`,
+      body: `Hi ${lawyer.name},\n\nYou have received a new hiring request from ${req.user.name} (${req.user.email}).\nBudget: $${hiring.budget}\n\nPlease check your dashboard to accept or reject this request.\n\n— LegalEase Team`,
+    });
 
     return res.json({
       success: true,
@@ -778,6 +704,21 @@ app.patch("/api/hirings/:id/:action", verifyUser, async (req, res) => {
         success: false,
         message: "Request not found or already acted on",
       });
+    }
+
+    // ── Dummy Email Notification ──
+    const hiring = await db.collection("hiring").findOne({ _id: new ObjectId(id) });
+    if (hiring) {
+      const client = await db.collection("user").findOne({ _id: new ObjectId(hiring.userId) });
+      if (client) {
+        sendDummyEmail({
+          to: client.email,
+          subject: action === "accept" ? `Hiring Accepted by ${req.user.name}` : `Hiring Update from ${req.user.name}`,
+          body: action === "accept"
+            ? `Hi ${client.name},\n\nGreat news! Lawyer ${req.user.name} has accepted your hiring request.\nPlease proceed to payment from your hiring history page.\n\n— LegalEase Team`
+            : `Hi ${client.name},\n\nUnfortunately, lawyer ${req.user.name} has declined your hiring request.\nYou can browse other lawyers and try again.\n\n— LegalEase Team`,
+        });
+      }
     }
 
     return res.json({ success: true, message: `Request ${newStatus}` });
@@ -854,7 +795,7 @@ app.post("/api/payments/create-checkout", verifyUser, async (req, res) => {
       ],
       mode: "payment",
       success_url: `${frontendUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${frontendUrl}/dashboard/user/hiring-history`,
+      cancel_url: `${frontendUrl}/dashboard/client/hiring-history`,
       client_reference_id: hiringId,
       metadata: {
         hiringId: hiringId,
@@ -886,6 +827,9 @@ app.get("/api/payments/status/:sessionId", verifyUser, async (req, res) => {
     if (session.payment_status === "paid") {
       const hiringId = session.metadata?.hiringId;
       if (hiringId) {
+        const hiring = await db.collection("hiring").findOne({ _id: new ObjectId(hiringId) });
+        const wasAlreadyPaid = hiring && hiring.status === "paid";
+
         await db.collection("hiring").updateOne(
           { _id: new ObjectId(hiringId), userId: req.user._id.toString() },
           {
@@ -897,6 +841,23 @@ app.get("/api/payments/status/:sessionId", verifyUser, async (req, res) => {
             },
           },
         );
+
+        // ── Dummy Email: Payment Confirmation (only on first verification) ──
+        if (!wasAlreadyPaid && hiring) {
+          const lawyer = await db.collection("user").findOne({ _id: new ObjectId(hiring.lawyerId) });
+          if (lawyer) {
+            sendDummyEmail({
+              to: lawyer.email,
+              subject: `Payment Received from ${req.user.name}`,
+              body: `Hi ${lawyer.name},\n\nPayment of $${session.amount_total / 100} has been received from client ${req.user.name} (${req.user.email}).\n\nPlease proceed with the consultation.\n\n— LegalEase Team`,
+            });
+          }
+          sendDummyEmail({
+            to: req.user.email,
+            subject: `Payment Confirmation — LegalEase`,
+            body: `Hi ${req.user.name},\n\nYour payment of $${session.amount_total / 100} for the hiring of ${lawyer?.name || "your lawyer"} has been confirmed.\n\nThank you for using LegalEase!\n\n— LegalEase Team`,
+          });
+        }
       }
 
       return res.json({
@@ -1095,7 +1056,7 @@ app.post("/api/comments", verifyUser, async (req, res) => {
       });
     }
 
-    if (req.user.role !== "user") {
+    if (req.user.role !== "client") {
       return res
         .status(403)
         .json({ success: false, message: "Only clients can leave reviews" });
@@ -1494,7 +1455,7 @@ app.get("/api/admin/users", verifyUser, verifyAdmin, async (req, res) => {
 
     const roleCounts = { client: 0, lawyer: 0, admin: 0 };
     users.forEach((u) => {
-      const r = u.role === "user" ? "client" : u.role;
+      const r = u.role || "client";
       if (roleCounts[r] !== undefined) roleCounts[r]++;
     });
 
@@ -1572,7 +1533,7 @@ app.patch(
       const { role } = req.body;
       const userId = req.params.id;
 
-      if (!["user", "client", "lawyer", "admin"].includes(role)) {
+      if (!["client", "lawyer", "admin"].includes(role)) {
         return res
           .status(400)
           .json({ success: false, message: "Invalid role" });
@@ -1745,7 +1706,7 @@ app.get("/api/admin/stats", verifyUser, verifyAdmin, async (req, res) => {
   try {
     const [totalUsers, totalLawyers, totalHires, acceptedHires, paidHires] =
       await Promise.all([
-        db.collection("user").countDocuments({}),
+        db.collection("user").countDocuments({ role: { $in: ["client", "admin"] } }),
         db.collection("user").countDocuments({ role: { $in: ["lawyer"] } }),
         db.collection("hiring").countDocuments({}),
         db.collection("hiring").countDocuments({ status: "accepted" }),
@@ -1867,6 +1828,334 @@ app.get("/api/admin/analytics", verifyUser, verifyAdmin, async (req, res) => {
     return res
       .status(500)
       .json({ success: false, message: "Failed to fetch analytics" });
+  }
+});
+
+// ─── Dummy Email Notification Helper (Nodemailer + Ethereal) ─────
+async function sendDummyEmail({ to, subject, body }) {
+  // Always log to console
+  console.log(`\n📧 DUMMY EMAIL SENT:`);
+  console.log(`   To: ${to}`);
+  console.log(`   Subject: ${subject}`);
+  console.log(`   Body: ${body}`);
+  console.log(`   Timestamp: ${new Date().toISOString()}\n`);
+
+  // Send via Ethereal (test email service) if transporter is available
+  if (dummyTransporter && dummyEmailAccount) {
+    try {
+      const info = await dummyTransporter.sendMail({
+        from: `"LegalEase" <${dummyEmailAccount.user}>`,
+        to,
+        subject,
+        text: body,
+      });
+      console.log(`   ✅ Ethereal Preview URL: ${nodemailer.getTestMessageUrl(info)}`);
+    } catch (err) {
+      console.warn(`   ⚠️  Ethereal send failed: ${err.message}`);
+    }
+  }
+}
+
+// ─── API: Shortlist (Client) ───────────────────────────────────────
+// GET /api/shortlist — get user's shortlisted lawyers
+app.get("/api/shortlist", verifyUser, async (req, res) => {
+  try {
+    const shortlist = await db
+      .collection("shortlist")
+      .find({ userId: req.user._id.toString() })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    // Enrich with lawyer details
+    const lawyers = await Promise.all(
+      shortlist.map(async (s) => {
+        const lawyer = await db
+          .collection("user")
+          .findOne(
+            { _id: new ObjectId(s.lawyerId), role: "lawyer" },
+            { projection: { name: 1, image: 1, specialization: 1, hourlyRate: 1, city: 1, location: 1, rating: 1 } },
+          );
+        if (!lawyer) return null;
+
+        // Check review stats
+        const reviewAgg = await db
+          .collection("comment")
+          .aggregate([
+            { $match: { lawyerId: s.lawyerId } },
+            { $group: { _id: null, avgRating: { $avg: "$rating" }, total: { $sum: 1 } } },
+          ])
+          .toArray();
+
+        return {
+          _id: s._id.toString(),
+          lawyerId: s.lawyerId,
+          addedAt: s.createdAt,
+          name: lawyer.name,
+          image: lawyer.image,
+          specialization: lawyer.specialization,
+          hourlyRate: lawyer.hourlyRate || 0,
+          location: lawyer.city || lawyer.location || "",
+          rating: Math.round((reviewAgg[0]?.avgRating || 0) * 10) / 10,
+          reviews: reviewAgg[0]?.total || 0,
+        };
+      }),
+    );
+
+    return res.json({
+      success: true,
+      data: { shortlist: lawyers.filter(Boolean) },
+    });
+  } catch (err) {
+    console.error("Error fetching shortlist:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch shortlist" });
+  }
+});
+
+// POST /api/shortlist — add lawyer to shortlist
+app.post("/api/shortlist", verifyUser, async (req, res) => {
+  try {
+    const { lawyerId } = req.body;
+    if (!lawyerId) {
+      return res.status(400).json({
+        success: false,
+        message: "Lawyer ID is required",
+      });
+    }
+
+    const lawyer = await db.collection("user").findOne({
+      _id: new ObjectId(lawyerId),
+      role: "lawyer",
+    });
+    if (!lawyer) {
+      return res.status(404).json({
+        success: false,
+        message: "Lawyer not found",
+      });
+    }
+
+    const existing = await db.collection("shortlist").findOne({
+      userId: req.user._id.toString(),
+      lawyerId,
+    });
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        message: "Already in shortlist",
+      });
+    }
+
+    await db.collection("shortlist").insertOne({
+      userId: req.user._id.toString(),
+      lawyerId,
+      createdAt: new Date(),
+    });
+
+    return res.json({
+      success: true,
+      message: "Added to shortlist",
+    });
+  } catch (err) {
+    console.error("Error adding to shortlist:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to add to shortlist" });
+  }
+});
+
+// DELETE /api/shortlist/:lawyerId — remove from shortlist
+app.delete("/api/shortlist/:lawyerId", verifyUser, async (req, res) => {
+  try {
+    const result = await db.collection("shortlist").deleteOne({
+      userId: req.user._id.toString(),
+      lawyerId: req.params.lawyerId,
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Not found in shortlist",
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: "Removed from shortlist",
+    });
+  } catch (err) {
+    console.error("Error removing from shortlist:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to remove from shortlist" });
+  }
+});
+
+// ─── API: Get Lawyer Details (Public) ────────────────────────────────
+// GET /api/lawyers/:id
+// Returns lawyer profile, review stats, total hires, and comments
+app.get("/api/lawyers/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid lawyer ID" });
+    }
+
+    // Fetch lawyer profile
+    const lawyer = await db.collection("user").findOne(
+      { _id: new ObjectId(id), role: "lawyer" },
+      {
+        projection: {
+          name: 1,
+          image: 1,
+          specialization: 1,
+          bio: 1,
+          hourlyRate: 1,
+          phone: 1,
+          barLicenseNumber: 1,
+          experience: 1,
+          education: 1,
+          languages: 1,
+          location: 1,
+          city: 1,
+          achievements: 1,
+          isAvailable: 1,
+          createdAt: 1,
+        },
+      },
+    );
+
+    if (!lawyer) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Lawyer not found" });
+    }
+
+    // Get review stats
+    const reviewStats = await db
+      .collection("comment")
+      .aggregate([
+        { $match: { lawyerId: id } },
+        {
+          $group: {
+            _id: null,
+            avgRating: { $avg: "$rating" },
+            totalReviews: { $sum: 1 },
+          },
+        },
+      ])
+      .toArray();
+
+    // Get total hires count (accepted only)
+    const totalHires = await db.collection("hiring").countDocuments({
+      lawyerId: id,
+      status: "accepted",
+    });
+
+    // Get comments with commenter names
+    const comments = await db
+      .collection("comment")
+      .find({ lawyerId: id })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const enrichedComments = await Promise.all(
+      comments.map(async (comment) => {
+        let userName = "Unknown";
+        let userImage = null;
+
+        if (comment.userId) {
+          try {
+            const commenter = await db
+              .collection("user")
+              .findOne(
+                { _id: new ObjectId(comment.userId) },
+                { projection: { name: 1, image: 1 } },
+              );
+            if (commenter) {
+              userName = commenter.name || "Unknown";
+              userImage = commenter.image || null;
+            }
+          } catch {
+            // invalid userId, skip
+          }
+        }
+
+        return {
+          _id: comment._id.toString(),
+          userId: comment.userId,
+          userName,
+          userImage,
+          text: comment.text || "",
+          rating: comment.rating || 0,
+          date: comment.createdAt,
+        };
+      }),
+    );
+
+    return res.json({
+      success: true,
+      data: {
+        lawyer: {
+          id: lawyer._id.toString(),
+          name: lawyer.name,
+          image: lawyer.image,
+          specialization: lawyer.specialization,
+          bio: lawyer.bio,
+          hourlyRate: lawyer.hourlyRate || 0,
+          phone: lawyer.phone,
+          barLicenseNumber: lawyer.barLicenseNumber,
+          experience: lawyer.experience || 0,
+          education: lawyer.education || [],
+          languages: lawyer.languages || [],
+          city: lawyer.city || lawyer.location || "",
+          location: lawyer.location || lawyer.city || "",
+          achievements: lawyer.achievements || [],
+          isAvailable: lawyer.isAvailable !== false,
+          status: lawyer.isAvailable === false ? "busy" : "available",
+          dateJoined: lawyer.createdAt,
+          rating: reviewStats[0]?.avgRating
+            ? Number(reviewStats[0].avgRating.toFixed(1))
+            : 0,
+          reviews: reviewStats[0]?.totalReviews || 0,
+          totalHires,
+        },
+        comments: enrichedComments,
+      },
+    });
+  } catch (err) {
+    console.error("Error fetching lawyer details:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch lawyer details" });
+  }
+});
+
+// ─── API: Check if lawyer is hired (for detail page) ────────────────
+// GET /api/lawyers/:id/hired-status
+app.get("/api/lawyers/:id/hired-status", verifyUser, async (req, res) => {
+  try {
+    const hiring = await db.collection("hiring").findOne({
+      userId: req.user._id.toString(),
+      lawyerId: req.params.id,
+      status: { $in: ["accepted", "paid"] },
+    });
+    const shortlisted = await db.collection("shortlist").findOne({
+      userId: req.user._id.toString(),
+      lawyerId: req.params.id,
+    });
+    return res.json({
+      success: true,
+      data: {
+        isHired: !!hiring,
+        isShortlisted: !!shortlisted,
+      },
+    });
+  } catch (err) {
+    return res.json({ success: true, data: { isHired: false, isShortlisted: false } });
   }
 });
 
