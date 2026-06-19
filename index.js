@@ -100,6 +100,173 @@ app.get("/", (req, res) => {
 // PUBLIC ROUTES (No Auth Required)
 // ═══════════════════════════════════════════════════════════════════════
 
+// ─── API: Browse Lawyers (Public) ────────────────────────────────────
+// GET /api/lawyers?search=&specialization=&availability=&minFee=&maxFee=&sort=&page=&limit=
+app.get("/api/lawyers", async (req, res) => {
+  try {
+    const { search, specialization, availability, minFee, maxFee, sort } =
+      req.query;
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 9));
+    const skip = (page - 1) * limit;
+
+    // Slug-to-full-name mapping for specialization from LegalCategories links
+    const SPEC_MAP = {
+      criminal: "Criminal Law",
+      corporate: "Corporate Law",
+      family: "Family Law",
+      "real-estate": "Real Estate",
+      immigration: "Immigration",
+      civil: "Civil Litigation",
+      tax: "Tax Law",
+      employment: "Employment Law",
+      ip: "Intellectual Property",
+      injury: "Personal Injury",
+      bankruptcy: "Bankruptcy",
+      constitutional: "Constitutional Law",
+    };
+
+    // Build match filter
+    const match = { role: "lawyer" };
+
+    if (search) {
+      const regex = new RegExp(search, "i");
+      match.$or = [
+        { name: { $regex: regex } },
+        { specialization: { $regex: regex } },
+      ];
+    }
+
+    if (specialization) {
+      // Could be a slug (from LegalCategories) or full name (from dropdown)
+      const mapped = SPEC_MAP[specialization] || specialization;
+      // Use regex for flexible matching (e.g. "Real Estate" matches "Real Estate Law")
+      match.specialization = {
+        $regex: new RegExp(
+          `^${mapped.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
+          "i",
+        ),
+      };
+    }
+
+    if (availability === "available") {
+      match.isAvailable = { $ne: false };
+    } else if (availability === "busy") {
+      match.isAvailable = false;
+    }
+
+    if (minFee || maxFee) {
+      match.hourlyRate = {};
+      if (minFee) match.hourlyRate.$gte = Number(minFee);
+      if (maxFee) match.hourlyRate.$lte = Number(maxFee);
+    }
+
+    // Aggregation pipeline
+    const pipeline = [
+      { $match: match },
+      {
+        $lookup: {
+          from: "comment",
+          let: { lawyerIdStr: { $toString: "$_id" } },
+          pipeline: [
+            {
+              $match: {
+                $expr: { $eq: ["$lawyerId", "$$lawyerIdStr"] },
+              },
+            },
+            {
+              $group: {
+                _id: "$lawyerId",
+                avgRating: { $avg: "$rating" },
+                totalReviews: { $sum: 1 },
+              },
+            },
+          ],
+          as: "reviewStats",
+        },
+      },
+      {
+        $unwind: {
+          path: "$reviewStats",
+          preserveNullAndEmptyArrays: true,
+        },
+      },
+      {
+        $addFields: {
+          rating: {
+            $ifNull: [{ $round: ["$reviewStats.avgRating", 1] }, 0],
+          },
+          reviews: {
+            $ifNull: ["$reviewStats.totalReviews", 0],
+          },
+          status: {
+            $cond: [{ $eq: ["$isAvailable", false] }, "busy", "available"],
+          },
+        },
+      },
+    ];
+
+    // Sort
+    const sortMap = {
+      "rating-desc": { rating: -1 },
+      "rating-asc": { rating: 1 },
+      "fee-asc": { hourlyRate: 1 },
+      "fee-desc": { hourlyRate: -1 },
+      "reviews-desc": { reviews: -1 },
+    };
+    const sortObj = sortMap[sort] || { createdAt: -1 };
+    pipeline.push({ $sort: sortObj });
+
+    // Facet: total count + paginated data
+    pipeline.push({
+      $facet: {
+        total: [{ $count: "count" }],
+        lawyers: [
+          { $skip: skip },
+          { $limit: limit },
+          {
+            $project: {
+              id: "$_id",
+              name: 1,
+              image: 1,
+              specialization: 1,
+              hourlyRate: 1,
+              city: 1,
+              location: 1,
+              rating: 1,
+              reviews: 1,
+              status: 1,
+            },
+          },
+        ],
+      },
+    });
+
+    const result = await db.collection("user").aggregate(pipeline).toArray();
+    const batch = result[0];
+    const total = batch.total[0]?.count || 0;
+
+    // Ensure rating is a number
+    const lawyers = (batch.lawyers || []).map((l) => ({
+      ...l,
+      id: l.id.toString(),
+      rating: Number(l.rating) || 0,
+      hourlyRate: l.hourlyRate || 0,
+      location: l.city || l.location || "",
+    }));
+
+    return res.json({
+      success: true,
+      data: { lawyers, total },
+    });
+  } catch (err) {
+    console.error("Error browsing lawyers:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch lawyers" });
+  }
+});
+
 // ─── API: Get Featured Lawyers (Public) ──────────────────────────────
 // GET /api/lawyers/featured
 // Returns top 6 lawyers sorted by avg rating (desc), then by review count (desc)
