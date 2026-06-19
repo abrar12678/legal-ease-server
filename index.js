@@ -1667,10 +1667,12 @@ app.get(
       if (status && status !== "all") {
         const statusMap = {
           completed: "paid",
-          pending: "pending",
           failed: "rejected",
         };
         filter.status = statusMap[status] || status;
+      } else {
+        // When "all", only show paid + rejected (actual transactions), skip pending/accepted
+        filter.status = { $in: ["paid", "rejected"] };
       }
 
       const hirings = await db
@@ -1741,12 +1743,13 @@ app.get(
 // GET /api/admin/stats
 app.get("/api/admin/stats", verifyUser, verifyAdmin, async (req, res) => {
   try {
-    const [totalUsers, totalLawyers, totalHires, acceptedHires] =
+    const [totalUsers, totalLawyers, totalHires, acceptedHires, paidHires] =
       await Promise.all([
         db.collection("user").countDocuments({}),
         db.collection("user").countDocuments({ role: { $in: ["lawyer"] } }),
         db.collection("hiring").countDocuments({}),
         db.collection("hiring").countDocuments({ status: "accepted" }),
+        db.collection("hiring").countDocuments({ status: "paid" }),
       ]);
 
     const revenueAgg = await db
@@ -1765,6 +1768,7 @@ app.get("/api/admin/stats", verifyUser, verifyAdmin, async (req, res) => {
         totalLawyers,
         totalHires,
         totalRevenue,
+        paidHires,
       },
     });
   } catch (err) {
