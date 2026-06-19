@@ -110,7 +110,6 @@ app.get("/api/lawyers", async (req, res) => {
     const limit = Math.min(50, Math.max(1, parseInt(req.query.limit) || 9));
     const skip = (page - 1) * limit;
 
-    // Slug-to-full-name mapping for specialization from LegalCategories links
     const SPEC_MAP = {
       criminal: "Criminal Law",
       corporate: "Corporate Law",
@@ -126,7 +125,6 @@ app.get("/api/lawyers", async (req, res) => {
       constitutional: "Constitutional Law",
     };
 
-    // Build match filter
     const match = { role: "lawyer" };
 
     if (search) {
@@ -138,9 +136,7 @@ app.get("/api/lawyers", async (req, res) => {
     }
 
     if (specialization) {
-      // Could be a slug (from LegalCategories) or full name (from dropdown)
       const mapped = SPEC_MAP[specialization] || specialization;
-      // Use regex for flexible matching (e.g. "Real Estate" matches "Real Estate Law")
       match.specialization = {
         $regex: new RegExp(
           `^${mapped.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
@@ -161,7 +157,6 @@ app.get("/api/lawyers", async (req, res) => {
       if (maxFee) match.hourlyRate.$lte = Number(maxFee);
     }
 
-    // Aggregation pipeline
     const pipeline = [
       { $match: match },
       {
@@ -206,7 +201,6 @@ app.get("/api/lawyers", async (req, res) => {
       },
     ];
 
-    // Sort
     const sortMap = {
       "rating-desc": { rating: -1 },
       "rating-asc": { rating: 1 },
@@ -217,7 +211,6 @@ app.get("/api/lawyers", async (req, res) => {
     const sortObj = sortMap[sort] || { createdAt: -1 };
     pipeline.push({ $sort: sortObj });
 
-    // Facet: total count + paginated data
     pipeline.push({
       $facet: {
         total: [{ $count: "count" }],
@@ -246,7 +239,6 @@ app.get("/api/lawyers", async (req, res) => {
     const batch = result[0];
     const total = batch.total[0]?.count || 0;
 
-    // Ensure rating is a number
     const lawyers = (batch.lawyers || []).map((l) => ({
       ...l,
       id: l.id.toString(),
@@ -269,7 +261,6 @@ app.get("/api/lawyers", async (req, res) => {
 
 // ─── API: Get Featured Lawyers (Public) ──────────────────────────────
 // GET /api/lawyers/featured
-// Returns top 6 lawyers sorted by avg rating (desc), then by review count (desc)
 app.get("/api/lawyers/featured", async (req, res) => {
   try {
     const lawyers = await db
@@ -350,7 +341,6 @@ app.get("/api/lawyers/featured", async (req, res) => {
 
 // ─── API: Get Top Legal Experts (Public) ─────────────────────────────
 // GET /api/lawyers/top-experts
-// Returns top 3 lawyers with most hires, with avatar and name
 app.get("/api/lawyers/top-experts", async (req, res) => {
   try {
     const hireCounts = await db
@@ -401,7 +391,6 @@ app.get("/api/lawyers/top-experts", async (req, res) => {
 
 // ─── API: Get Legal Categories with Lawyer Counts (Public) ───────────
 // GET /api/lawyers/categories
-// Returns all specializations with lawyer count (dynamic from DB)
 app.get("/api/lawyers/categories", async (req, res) => {
   try {
     const categories = await db
@@ -429,6 +418,149 @@ app.get("/api/lawyers/categories", async (req, res) => {
     return res
       .status(500)
       .json({ success: false, message: "Failed to fetch categories" });
+  }
+});
+
+// ─── API: Get Lawyer Details (Public) ────────────────────────────────
+// GET /api/lawyers/:id
+// Returns lawyer profile, review stats, total hires, and comments
+app.get("/api/lawyers/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid lawyer ID" });
+    }
+
+    // Fetch lawyer profile
+    const lawyer = await db.collection("user").findOne(
+      { _id: new ObjectId(id), role: "lawyer" },
+      {
+        projection: {
+          name: 1,
+          image: 1,
+          specialization: 1,
+          bio: 1,
+          hourlyRate: 1,
+          phone: 1,
+          barLicenseNumber: 1,
+          experience: 1,
+          education: 1,
+          languages: 1,
+          location: 1,
+          city: 1,
+          achievements: 1,
+          isAvailable: 1,
+          createdAt: 1,
+        },
+      },
+    );
+
+    if (!lawyer) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Lawyer not found" });
+    }
+
+    // Get review stats
+    const reviewStats = await db
+      .collection("comment")
+      .aggregate([
+        { $match: { lawyerId: id } },
+        {
+          $group: {
+            _id: null,
+            avgRating: { $avg: "$rating" },
+            totalReviews: { $sum: 1 },
+          },
+        },
+      ])
+      .toArray();
+
+    // Get total hires count (accepted only)
+    const totalHires = await db.collection("hiring").countDocuments({
+      lawyerId: id,
+      status: "accepted",
+    });
+
+    // Get comments with commenter names
+    const comments = await db
+      .collection("comment")
+      .find({ lawyerId: id })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const enrichedComments = await Promise.all(
+      comments.map(async (comment) => {
+        let userName = "Unknown";
+        let userImage = null;
+
+        if (comment.userId) {
+          try {
+            const commenter = await db
+              .collection("user")
+              .findOne(
+                { _id: new ObjectId(comment.userId) },
+                { projection: { name: 1, image: 1 } },
+              );
+            if (commenter) {
+              userName = commenter.name || "Unknown";
+              userImage = commenter.image || null;
+            }
+          } catch {
+            // invalid userId, skip
+          }
+        }
+
+        return {
+          _id: comment._id.toString(),
+          userId: comment.userId,
+          userName,
+          userImage,
+          text: comment.text || "",
+          rating: comment.rating || 0,
+          date: comment.createdAt,
+        };
+      }),
+    );
+
+    return res.json({
+      success: true,
+      data: {
+        lawyer: {
+          id: lawyer._id.toString(),
+          name: lawyer.name,
+          image: lawyer.image,
+          specialization: lawyer.specialization,
+          bio: lawyer.bio,
+          hourlyRate: lawyer.hourlyRate || 0,
+          phone: lawyer.phone,
+          barLicenseNumber: lawyer.barLicenseNumber,
+          experience: lawyer.experience || 0,
+          education: lawyer.education || [],
+          languages: lawyer.languages || [],
+          city: lawyer.city || lawyer.location || "",
+          location: lawyer.location || lawyer.city || "",
+          achievements: lawyer.achievements || [],
+          isAvailable: lawyer.isAvailable !== false,
+          status: lawyer.isAvailable === false ? "busy" : "available",
+          dateJoined: lawyer.createdAt,
+          rating: reviewStats[0]?.avgRating
+            ? Number(reviewStats[0].avgRating.toFixed(1))
+            : 0,
+          reviews: reviewStats[0]?.totalReviews || 0,
+          totalHires,
+        },
+        comments: enrichedComments,
+      },
+    });
+  } catch (err) {
+    console.error("Error fetching lawyer details:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch lawyer details" });
   }
 });
 
@@ -712,6 +844,77 @@ app.put("/api/lawyers/profile", verifyUser, async (req, res) => {
     return res
       .status(500)
       .json({ success: false, message: "Failed to update profile" });
+  }
+});
+
+// ─── API: Create Comment / Review (Client) ──────────────────────────
+// POST /api/comments
+app.post("/api/comments", verifyUser, async (req, res) => {
+  try {
+    const { lawyerId, text, rating } = req.body;
+
+    if (!lawyerId || !text || !rating) {
+      return res.status(400).json({
+        success: false,
+        message: "lawyerId, text, and rating are required",
+      });
+    }
+
+    if (req.user.role !== "user") {
+      return res
+        .status(403)
+        .json({ success: false, message: "Only clients can leave reviews" });
+    }
+
+    if (!ObjectId.isValid(lawyerId)) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid lawyer ID" });
+    }
+
+    // Check if lawyer exists
+    const lawyer = await db.collection("user").findOne({
+      _id: new ObjectId(lawyerId),
+      role: "lawyer",
+    });
+    if (!lawyer) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Lawyer not found" });
+    }
+
+    // Check if user already commented on this lawyer
+    const existing = await db.collection("comment").findOne({
+      userId: req.user._id.toString(),
+      lawyerId,
+    });
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        message: "You have already reviewed this lawyer",
+      });
+    }
+
+    const comment = {
+      userId: req.user._id.toString(),
+      lawyerId,
+      text: text.trim(),
+      rating: Number(rating),
+      createdAt: new Date(),
+    };
+
+    const result = await db.collection("comment").insertOne(comment);
+
+    return res.status(201).json({
+      success: true,
+      message: "Review submitted successfully",
+      data: { _id: result.insertedId, ...comment },
+    });
+  } catch (err) {
+    console.error("Error creating comment:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to submit review" });
   }
 });
 
