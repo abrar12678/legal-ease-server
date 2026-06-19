@@ -96,6 +96,142 @@ app.get("/", (req, res) => {
   res.send("LegalEase Backend is running!");
 });
 
+// ═══════════════════════════════════════════════════════════════════════
+// PUBLIC ROUTES (No Auth Required)
+// ═══════════════════════════════════════════════════════════════════════
+
+// ─── API: Get Featured Lawyers (Public) ──────────────────────────────
+// GET /api/lawyers/featured
+// Returns top 6 lawyers sorted by avg rating (desc), then by review count (desc)
+app.get("/api/lawyers/featured", async (req, res) => {
+  try {
+    const lawyers = await db
+      .collection("user")
+      .find({ role: "lawyer" })
+      .project({
+        name: 1,
+        image: 1,
+        specialization: 1,
+        hourlyRate: 1,
+        experience: 1,
+        city: 1,
+        location: 1,
+        isAvailable: 1,
+        bio: 1,
+      })
+      .toArray();
+
+    if (lawyers.length === 0) {
+      return res.json({ success: true, data: { lawyers: [] } });
+    }
+
+    const lawyerIds = lawyers.map((l) => l._id.toString());
+
+    const reviewStats = await db
+      .collection("comment")
+      .aggregate([
+        { $match: { lawyerId: { $in: lawyerIds } } },
+        {
+          $group: {
+            _id: "$lawyerId",
+            avgRating: { $avg: "$rating" },
+            totalReviews: { $sum: 1 },
+          },
+        },
+      ])
+      .toArray();
+
+    const statsMap = {};
+    reviewStats.forEach((s) => {
+      statsMap[s._id] = {
+        rating: Number(s.avgRating.toFixed(1)),
+        totalReviews: s.totalReviews,
+      };
+    });
+
+    const enriched = lawyers.map((l) => ({
+      _id: l._id.toString(),
+      name: l.name,
+      image: l.image,
+      specialization: l.specialization,
+      hourlyRate: l.hourlyRate || 0,
+      experience: l.experience || 0,
+      city: l.city || l.location || "",
+      location: l.location || "",
+      isAvailable: l.isAvailable !== false,
+      bio: l.bio,
+      rating: statsMap[l._id.toString()]?.rating || 0,
+      totalReviews: statsMap[l._id.toString()]?.totalReviews || 0,
+    }));
+
+    enriched.sort((a, b) => {
+      if (b.rating !== a.rating) return b.rating - a.rating;
+      return b.totalReviews - a.totalReviews;
+    });
+
+    return res.json({
+      success: true,
+      data: { lawyers: enriched.slice(0, 6) },
+    });
+  } catch (err) {
+    console.error("Error fetching featured lawyers:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch featured lawyers" });
+  }
+});
+
+// ─── API: Get Top Legal Experts (Public) ─────────────────────────────
+// GET /api/lawyers/top-experts
+// Returns top 3 lawyers with most hires, with avatar and name
+app.get("/api/lawyers/top-experts", async (req, res) => {
+  try {
+    const hireCounts = await db
+      .collection("hiring")
+      .aggregate([
+        { $match: { lawyerId: { $exists: true, $ne: "" } } },
+        { $group: { _id: "$lawyerId", totalHires: { $sum: 1 } } },
+        { $sort: { totalHires: -1 } },
+        { $limit: 3 },
+      ])
+      .toArray();
+
+    if (hireCounts.length === 0) {
+      return res.json({ success: true, data: { lawyers: [] } });
+    }
+
+    const topLawyers = await Promise.all(
+      hireCounts.map(async (h) => {
+        const lawyer = await db.collection("user").findOne(
+          { _id: new ObjectId(h._id) },
+          {
+            projection: {
+              name: 1,
+              image: 1,
+              specialization: 1,
+            },
+          },
+        );
+
+        return {
+          _id: h._id,
+          name: lawyer?.name || "Unknown",
+          image: lawyer?.image || null,
+          specialization: lawyer?.specialization || "",
+          totalHires: h.totalHires,
+        };
+      }),
+    );
+
+    return res.json({ success: true, data: { lawyers: topLawyers } });
+  } catch (err) {
+    console.error("Error fetching top experts:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch top experts" });
+  }
+});
+
 // ─── API: Get My Hirings (Client) ────────────────────────────────────
 // GET /api/hirings/my-hirings?limit=100
 app.get("/api/hirings/my-hirings", verifyUser, async (req, res) => {
@@ -793,7 +929,6 @@ app.get(
 
 // ─── API: Get Admin Stats (Admin) ────────────────────────────────────
 // GET /api/admin/stats
-// Used by: Admin Dashboard + Analytics page (top cards)
 app.get("/api/admin/stats", verifyUser, verifyAdmin, async (req, res) => {
   try {
     const [totalUsers, totalLawyers, totalHires, acceptedHires] =
@@ -804,7 +939,6 @@ app.get("/api/admin/stats", verifyUser, verifyAdmin, async (req, res) => {
         db.collection("hiring").countDocuments({ status: "accepted" }),
       ]);
 
-    // Revenue = sum of budget from accepted hirings
     const revenueAgg = await db
       .collection("hiring")
       .aggregate([
@@ -833,14 +967,11 @@ app.get("/api/admin/stats", verifyUser, verifyAdmin, async (req, res) => {
 
 // ─── API: Get Admin Analytics (Admin) ────────────────────────────────
 // GET /api/admin/analytics
-// Returns: monthlyUsers, monthlyHires, monthlyRevenue (last 6 months),
-//          topSpecializations, recentActivity
 app.get("/api/admin/analytics", verifyUser, verifyAdmin, async (req, res) => {
   try {
     const now = new Date();
     const months = [];
 
-    // Generate last 6 months
     for (let i = 5; i >= 0; i--) {
       const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
       const start = new Date(d.getFullYear(), d.getMonth(), 1);
@@ -852,7 +983,6 @@ app.get("/api/admin/analytics", verifyUser, verifyAdmin, async (req, res) => {
       months.push({ start, end, month: label });
     }
 
-    // Monthly users, hires, revenue
     const monthlyUsers = await Promise.all(
       months.map(async (m) => {
         const count = await db.collection("user").countDocuments({
@@ -889,7 +1019,6 @@ app.get("/api/admin/analytics", verifyUser, verifyAdmin, async (req, res) => {
       }),
     );
 
-    // Top specializations (from lawyer users)
     const topSpecs = await db
       .collection("user")
       .aggregate([
