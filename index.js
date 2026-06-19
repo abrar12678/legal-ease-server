@@ -232,6 +232,39 @@ app.get("/api/lawyers/top-experts", async (req, res) => {
   }
 });
 
+// ─── API: Get Legal Categories with Lawyer Counts (Public) ───────────
+// GET /api/lawyers/categories
+// Returns all specializations with lawyer count (dynamic from DB)
+app.get("/api/lawyers/categories", async (req, res) => {
+  try {
+    const categories = await db
+      .collection("user")
+      .aggregate([
+        {
+          $match: {
+            role: "lawyer",
+            specialization: { $exists: true, $ne: "", $ne: null },
+          },
+        },
+        { $group: { _id: "$specialization", count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+      ])
+      .toArray();
+
+    const result = categories.map((c) => ({
+      name: c._id || "Other",
+      count: c.count,
+    }));
+
+    return res.json({ success: true, data: { categories: result } });
+  } catch (err) {
+    console.error("Error fetching categories:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch categories" });
+  }
+});
+
 // ─── API: Get My Hirings (Client) ────────────────────────────────────
 // GET /api/hirings/my-hirings?limit=100
 app.get("/api/hirings/my-hirings", verifyUser, async (req, res) => {
