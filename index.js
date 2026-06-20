@@ -601,10 +601,10 @@ app.post("/api/hirings", verifyUser, async (req, res) => {
   try {
     const { lawyerId, budget } = req.body;
 
-    if (req.user.role !== "client") {
+    if (req.user.role !== "user") {
       return res
         .status(403)
-        .json({ success: false, message: "Only clients can hire lawyers" });
+        .json({ success: false, message: "Only users can hire lawyers" });
     }
 
     if (!lawyerId) {
@@ -795,7 +795,7 @@ app.post("/api/payments/create-checkout", verifyUser, async (req, res) => {
       ],
       mode: "payment",
       success_url: `${frontendUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${frontendUrl}/dashboard/client/hiring-history`,
+      cancel_url: `${frontendUrl}/dashboard/user/hiring-history`,
       client_reference_id: hiringId,
       metadata: {
         hiringId: hiringId,
@@ -1056,10 +1056,10 @@ app.post("/api/comments", verifyUser, async (req, res) => {
       });
     }
 
-    if (req.user.role !== "client") {
+    if (req.user.role !== "user") {
       return res
         .status(403)
-        .json({ success: false, message: "Only clients can leave reviews" });
+        .json({ success: false, message: "Only users can leave reviews" });
     }
 
     if (!ObjectId.isValid(lawyerId)) {
@@ -1453,9 +1453,9 @@ app.get("/api/admin/users", verifyUser, verifyAdmin, async (req, res) => {
       })
       .toArray();
 
-    const roleCounts = { client: 0, lawyer: 0, admin: 0 };
+    const roleCounts = { user: 0, lawyer: 0, admin: 0 };
     users.forEach((u) => {
-      const r = u.role || "client";
+      const r = u.role || "user";
       if (roleCounts[r] !== undefined) roleCounts[r]++;
     });
 
@@ -1533,7 +1533,7 @@ app.patch(
       const { role } = req.body;
       const userId = req.params.id;
 
-      if (!["client", "lawyer", "admin"].includes(role)) {
+      if (!["user", "lawyer", "admin"].includes(role)) {
         return res
           .status(400)
           .json({ success: false, message: "Invalid role" });
@@ -1706,7 +1706,7 @@ app.get("/api/admin/stats", verifyUser, verifyAdmin, async (req, res) => {
   try {
     const [totalUsers, totalLawyers, totalHires, acceptedHires, paidHires] =
       await Promise.all([
-        db.collection("user").countDocuments({ role: { $in: ["client", "admin"] } }),
+        db.collection("user").countDocuments({ role: { $in: ["user", "admin"] } }),
         db.collection("user").countDocuments({ role: { $in: ["lawyer"] } }),
         db.collection("hiring").countDocuments({}),
         db.collection("hiring").countDocuments({ status: "accepted" }),
