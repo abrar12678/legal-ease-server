@@ -30,7 +30,10 @@ async function initDummyEmail() {
     });
     console.log("📧 Dummy Email transport initialized");
   } catch (err) {
-    console.warn("⚠️  Dummy Email transport failed to init, falling back to console logging:", err.message);
+    console.warn(
+      "⚠️  Dummy Email transport failed to init, falling back to console logging:",
+      err.message,
+    );
   }
 }
 initDummyEmail();
@@ -63,71 +66,77 @@ async function connectDB() {
 }
 connectDB();
 
-// ─── Auth Middleware ──────────────────────────────────────────────────
-async function verifyUser(req, res, next) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return res
-      .status(401)
-      .json({ success: false, message: "Unauthorized: No token provided" });
+// ═══════════════════════════════════════════════════════════════════════
+// TOKEN VERIFICATION (Same pattern as HireLoop)
+// ═══════════════════════════════════════════════════════════════════════
+
+// verification related
+const verifyToken = async (req, res, next) => {
+  const authHeader = req.headers?.authorization;
+  if (!authHeader) {
+    return res.status(401).send({ message: "unauthorized access" });
   }
 
   const token = authHeader.split(" ")[1];
 
-  try {
-    const session = await db.collection("session").findOne({ token });
-    if (!session) {
-      return res.status(401).json({
-        success: false,
-        message: "Unauthorized: Invalid or expired token",
-      });
-    }
-
-    if (session.expiresAt && new Date(session.expiresAt) < new Date()) {
-      await db.collection("session").deleteOne({ _id: session._id });
-      return res
-        .status(401)
-        .json({ success: false, message: "Unauthorized: Session expired" });
-    }
-
-    const user = await db
-      .collection("user")
-      .findOne({ _id: new ObjectId(session.userId) });
-    if (!user) {
-      return res
-        .status(401)
-        .json({ success: false, message: "Unauthorized: User not found" });
-    }
-
-    // Check if user is blocked
-    if (user.isBlocked) {
-      await db.collection("session").deleteOne({ _id: session._id });
-      return res.status(403).json({
-        success: false,
-        message: "Forbidden: Your account has been blocked. Contact an administrator.",
-      });
-    }
-
-    req.user = user;
-    req.sessionId = session._id;
-    next();
-  } catch (err) {
-    console.error("Auth middleware error:", err);
-    return res
-      .status(500)
-      .json({ success: false, message: "Internal server error" });
+  if (!token) {
+    return res.status(401).send({ message: "unauthorized access" });
   }
-}
 
-// ─── Admin Middleware ─────────────────────────────────────────────────
-function verifyAdmin(req, res, next) {
-  if (req.user.role !== "admin") {
+  const query = { token: token };
+  const session = await db.collection("session").findOne(query);
+
+  if (!session) {
+    return res.status(401).send({ message: "unauthorized access" });
+  }
+
+  const userId = session.userId;
+
+  const userQuery = {
+    _id: userId,
+  };
+
+  const user = await db.collection("user").findOne(userQuery);
+  if (!user) {
+    return res.status(401).send({ message: "unauthorized access" });
+  }
+
+  // Check if user is blocked
+  if (user.isBlocked) {
+    await db.collection("session").deleteOne({ _id: session._id });
     return res
       .status(403)
-      .json({ success: false, message: "Forbidden: Admin access required" });
+      .send({ message: "forbidden access: account blocked" });
+  }
+
+  // set data in the req object
+  req.user = user;
+  next();
+};
+
+// must be used after verifyToken middleware
+const verifyLawyer = async (req, res, next) => {
+  if (req.user?.role !== "lawyer") {
+    return res.status(403).send({ message: "forbidden access" });
   }
   next();
-}
+};
+
+// must be used after verifyToken middleware
+const verifyClient = async (req, res, next) => {
+  if (req.user?.role !== "user") {
+    return res.status(403).send({ message: "forbidden access" });
+  }
+  next();
+};
+
+// must be used after verifyToken middleware
+const verifyAdmin = async (req, res, next) => {
+  if (req.user.role !== "admin") {
+    return res.status(403).send({ message: "forbidden access" });
+  }
+  next();
+};
 
 // ─── Health Check ────────────────────────────────────────────────────
 app.get("/", (req, res) => {
@@ -292,23 +301,32 @@ app.get("/api/lawyers", async (req, res) => {
       try {
         const token = authHeader.split(" ")[1];
         const session = await db.collection("session").findOne({ token });
-        if (session && !session.expiresAt || new Date(session.expiresAt) >= new Date()) {
+        if (
+          (session && !session.expiresAt) ||
+          new Date(session.expiresAt) >= new Date()
+        ) {
           const userId = session.userId.toString();
           const lawyerIds = lawyers.map((l) => l.id);
 
           // Check hired (accepted or paid)
-          const hirings = await db.collection("hiring").find({
-            userId,
-            lawyerId: { $in: lawyerIds },
-            status: { $in: ["accepted", "paid"] },
-          }).toArray();
+          const hirings = await db
+            .collection("hiring")
+            .find({
+              userId,
+              lawyerId: { $in: lawyerIds },
+              status: { $in: ["accepted", "paid"] },
+            })
+            .toArray();
           const hiredSet = new Set(hirings.map((h) => h.lawyerId));
 
           // Check shortlisted
-          const shortlisted = await db.collection("shortlist").find({
-            userId,
-            lawyerId: { $in: lawyerIds },
-          }).toArray();
+          const shortlisted = await db
+            .collection("shortlist")
+            .find({
+              userId,
+              lawyerId: { $in: lawyerIds },
+            })
+            .toArray();
           const shortlistSet = new Set(shortlisted.map((s) => s.lawyerId));
 
           lawyers.forEach((l) => {
@@ -497,7 +515,7 @@ app.get("/api/lawyers/categories", async (req, res) => {
 
 // ─── API: Get My Hirings (Client) ────────────────────────────────────
 // GET /api/hirings/my-hirings?limit=100
-app.get("/api/hirings/my-hirings", verifyUser, async (req, res) => {
+app.get("/api/hirings/my-hirings", verifyToken, async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 100;
 
@@ -550,7 +568,7 @@ app.get("/api/hirings/my-hirings", verifyUser, async (req, res) => {
 
 // ─── API: Get Lawyer Requests ────────────────────────────────────────
 // GET /api/hirings/lawyer-requests
-app.get("/api/hirings/lawyer-requests", verifyUser, async (req, res) => {
+app.get("/api/hirings/lawyer-requests", verifyToken, async (req, res) => {
   try {
     const hirings = await db
       .collection("hiring")
@@ -597,15 +615,9 @@ app.get("/api/hirings/lawyer-requests", verifyUser, async (req, res) => {
 
 // ─── API: Create Hiring Request (Client) ────────────────────────────
 // POST /api/hirings
-app.post("/api/hirings", verifyUser, async (req, res) => {
+app.post("/api/hirings", verifyToken, verifyClient, async (req, res) => {
   try {
     const { lawyerId, budget } = req.body;
-
-    if (req.user.role !== "user") {
-      return res
-        .status(403)
-        .json({ success: false, message: "Only users can hire lawyers" });
-    }
 
     if (!lawyerId) {
       return res
@@ -669,67 +681,72 @@ app.post("/api/hirings", verifyUser, async (req, res) => {
 
 // ─── API: Accept / Reject Hiring Request ─────────────────────────────
 // PATCH /api/hirings/:id/accept   or   PATCH /api/hirings/:id/reject
-app.patch("/api/hirings/:id/:action", verifyUser, async (req, res) => {
-  try {
-    // Role check: only lawyers can accept/reject
-    if (req.user.role !== "lawyer") {
-      return res.status(403).json({
-        success: false,
-        message: "Forbidden: Only lawyers can accept or reject hiring requests",
-      });
-    }
+app.patch(
+  "/api/hirings/:id/:action",
+  verifyToken,
+  verifyLawyer,
+  async (req, res) => {
+    try {
+      const { id, action } = req.params;
 
-    const { id, action } = req.params;
-
-    if (action !== "accept" && action !== "reject") {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid action. Use 'accept' or 'reject'.",
-      });
-    }
-
-    const newStatus = action === "accept" ? "accepted" : "rejected";
-
-    const result = await db.collection("hiring").updateOne(
-      {
-        _id: new ObjectId(id),
-        lawyerId: req.user._id.toString(),
-        status: "pending",
-      },
-      { $set: { status: newStatus, updatedAt: new Date() } },
-    );
-
-    if (result.matchedCount === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "Request not found or already acted on",
-      });
-    }
-
-    // ── Dummy Email Notification ──
-    const hiring = await db.collection("hiring").findOne({ _id: new ObjectId(id) });
-    if (hiring) {
-      const client = await db.collection("user").findOne({ _id: new ObjectId(hiring.userId) });
-      if (client) {
-        sendDummyEmail({
-          to: client.email,
-          subject: action === "accept" ? `Hiring Accepted by ${req.user.name}` : `Hiring Update from ${req.user.name}`,
-          body: action === "accept"
-            ? `Hi ${client.name},\n\nGreat news! Lawyer ${req.user.name} has accepted your hiring request.\nPlease proceed to payment from your hiring history page.\n\n— LegalEase Team`
-            : `Hi ${client.name},\n\nUnfortunately, lawyer ${req.user.name} has declined your hiring request.\nYou can browse other lawyers and try again.\n\n— LegalEase Team`,
+      if (action !== "accept" && action !== "reject") {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid action. Use 'accept' or 'reject'.",
         });
       }
-    }
 
-    return res.json({ success: true, message: `Request ${newStatus}` });
-  } catch (err) {
-    console.error(`Error ${req.params.action}ing request:`, err);
-    return res.status(500).json({
-      success: false,
-      message: `Failed to ${req.params.action} request`,
-    });
-  }
-});
+      const newStatus = action === "accept" ? "accepted" : "rejected";
+
+      const result = await db.collection("hiring").updateOne(
+        {
+          _id: new ObjectId(id),
+          lawyerId: req.user._id.toString(),
+          status: "pending",
+        },
+        { $set: { status: newStatus, updatedAt: new Date() } },
+      );
+
+      if (result.matchedCount === 0) {
+        return res.status(404).json({
+          success: false,
+          message: "Request not found or already acted on",
+        });
+      }
+
+      // ── Dummy Email Notification ──
+      const hiring = await db
+        .collection("hiring")
+        .findOne({ _id: new ObjectId(id) });
+      if (hiring) {
+        const client = await db
+          .collection("user")
+          .findOne({ _id: new ObjectId(hiring.userId) });
+        if (client) {
+          sendDummyEmail({
+            to: client.email,
+            subject:
+              action === "accept"
+                ? `Hiring Accepted by ${req.user.name}`
+                : `Hiring Update from ${req.user.name}`,
+            body:
+              action === "accept"
+                ? `Hi ${client.name},\n\nGreat news! Lawyer ${req.user.name} has accepted your hiring request.\nPlease proceed to payment from your hiring history page.\n\n— LegalEase Team`
+                : `Hi ${client.name},\n\nUnfortunately, lawyer ${req.user.name} has declined your hiring request.\nYou can browse other lawyers and try again.\n\n— LegalEase Team`,
+          });
+        }
+      }
+
+      return res.json({ success: true, message: `Request ${newStatus}` });
+    } catch (err) {
+      console.error(`Error ${req.params.action}ing request:`, err);
+      return res.status(500).json({
+        success: false,
+        message: `Failed to ${req.params.action} request`,
+      });
+    }
+  },
+);
 
 // ═══════════════════════════════════════════════════════════════════════
 // PAYMENT ROUTES (Stripe Checkout Sessions — No Webhook Needed)
@@ -737,7 +754,7 @@ app.patch("/api/hirings/:id/:action", verifyUser, async (req, res) => {
 
 // ─── API: Create Stripe Checkout Session ─────────────────────────────
 // POST /api/payments/create-checkout
-app.post("/api/payments/create-checkout", verifyUser, async (req, res) => {
+app.post("/api/payments/create-checkout", verifyToken, async (req, res) => {
   try {
     const { hiringId } = req.body;
 
@@ -818,7 +835,7 @@ app.post("/api/payments/create-checkout", verifyUser, async (req, res) => {
 
 // ─── API: Verify Payment Status ──────────────────────────────────────
 // GET /api/payments/status/:sessionId
-app.get("/api/payments/status/:sessionId", verifyUser, async (req, res) => {
+app.get("/api/payments/status/:sessionId", verifyToken, async (req, res) => {
   try {
     const { sessionId } = req.params;
 
@@ -827,7 +844,9 @@ app.get("/api/payments/status/:sessionId", verifyUser, async (req, res) => {
     if (session.payment_status === "paid") {
       const hiringId = session.metadata?.hiringId;
       if (hiringId) {
-        const hiring = await db.collection("hiring").findOne({ _id: new ObjectId(hiringId) });
+        const hiring = await db
+          .collection("hiring")
+          .findOne({ _id: new ObjectId(hiringId) });
         const wasAlreadyPaid = hiring && hiring.status === "paid";
 
         await db.collection("hiring").updateOne(
@@ -844,7 +863,9 @@ app.get("/api/payments/status/:sessionId", verifyUser, async (req, res) => {
 
         // ── Dummy Email: Payment Confirmation (only on first verification) ──
         if (!wasAlreadyPaid && hiring) {
-          const lawyer = await db.collection("user").findOne({ _id: new ObjectId(hiring.lawyerId) });
+          const lawyer = await db
+            .collection("user")
+            .findOne({ _id: new ObjectId(hiring.lawyerId) });
           if (lawyer) {
             sendDummyEmail({
               to: lawyer.email,
@@ -887,16 +908,8 @@ app.get("/api/payments/status/:sessionId", verifyUser, async (req, res) => {
 
 // ─── API: Get Lawyer Profile ─────────────────────────────────────────
 // GET /api/lawyers/profile
-app.get("/api/lawyers/profile", verifyUser, async (req, res) => {
+app.get("/api/lawyers/profile", verifyToken, verifyLawyer, async (req, res) => {
   try {
-    // Role check: only lawyers
-    if (req.user.role !== "lawyer") {
-      return res.status(403).json({
-        success: false,
-        message: "Forbidden: This endpoint is for lawyers only",
-      });
-    }
-
     const user = await db.collection("user").findOne(
       { _id: req.user._id },
       {
@@ -962,16 +975,8 @@ app.get("/api/lawyers/profile", verifyUser, async (req, res) => {
 
 // ─── API: Update Lawyer Profile ──────────────────────────────────────
 // PUT /api/lawyers/profile
-app.put("/api/lawyers/profile", verifyUser, async (req, res) => {
+app.put("/api/lawyers/profile", verifyToken, verifyLawyer, async (req, res) => {
   try {
-    // Role check: only lawyers
-    if (req.user.role !== "lawyer") {
-      return res.status(403).json({
-        success: false,
-        message: "Forbidden: This endpoint is for lawyers only",
-      });
-    }
-
     const {
       name,
       image,
@@ -1045,7 +1050,7 @@ app.put("/api/lawyers/profile", verifyUser, async (req, res) => {
 
 // ─── API: Create Comment / Review (Client) ──────────────────────────
 // POST /api/comments
-app.post("/api/comments", verifyUser, async (req, res) => {
+app.post("/api/comments", verifyToken, verifyClient, async (req, res) => {
   try {
     const { lawyerId, text, rating } = req.body;
 
@@ -1054,12 +1059,6 @@ app.post("/api/comments", verifyUser, async (req, res) => {
         success: false,
         message: "lawyerId, text, and rating are required",
       });
-    }
-
-    if (req.user.role !== "user") {
-      return res
-        .status(403)
-        .json({ success: false, message: "Only users can leave reviews" });
     }
 
     if (!ObjectId.isValid(lawyerId)) {
@@ -1129,7 +1128,7 @@ app.post("/api/comments", verifyUser, async (req, res) => {
 
 // ─── API: Get My Comments ────────────────────────────────────────────
 // GET /api/comments/my-comments
-app.get("/api/comments/my-comments", verifyUser, async (req, res) => {
+app.get("/api/comments/my-comments", verifyToken, async (req, res) => {
   try {
     const comments = await db
       .collection("comment")
@@ -1179,7 +1178,7 @@ app.get("/api/comments/my-comments", verifyUser, async (req, res) => {
 
 // ─── API: Update a Comment ───────────────────────────────────────────
 // PUT /api/comments/:id
-app.put("/api/comments/:id", verifyUser, async (req, res) => {
+app.put("/api/comments/:id", verifyToken, async (req, res) => {
   try {
     const { text, rating } = req.body;
 
@@ -1207,7 +1206,7 @@ app.put("/api/comments/:id", verifyUser, async (req, res) => {
 
 // ─── API: Delete a Comment ───────────────────────────────────────────
 // DELETE /api/comments/:id
-app.delete("/api/comments/:id", verifyUser, async (req, res) => {
+app.delete("/api/comments/:id", verifyToken, async (req, res) => {
   try {
     const result = await db.collection("comment").deleteOne({
       _id: new ObjectId(req.params.id),
@@ -1231,7 +1230,7 @@ app.delete("/api/comments/:id", verifyUser, async (req, res) => {
 
 // ─── API: Update User Profile (Client) ───────────────────────────────
 // PUT /api/users/update-profile
-app.put("/api/users/update-profile", verifyUser, async (req, res) => {
+app.put("/api/users/update-profile", verifyToken, async (req, res) => {
   try {
     const { name, image } = req.body;
 
@@ -1279,157 +1278,148 @@ app.put("/api/users/update-profile", verifyUser, async (req, res) => {
 
 // ─── API: Get Lawyer Services ──────────────────────────────────────
 // GET /api/lawyers/services
-app.get("/api/lawyers/services", verifyUser, async (req, res) => {
-  try {
-    if (req.user.role !== "lawyer") {
-      return res.status(403).json({
-        success: false,
-        message: "Forbidden: This endpoint is for lawyers only",
-      });
+app.get(
+  "/api/lawyers/services",
+  verifyToken,
+  verifyLawyer,
+  async (req, res) => {
+    try {
+      const services = await db
+        .collection("service")
+        .find({ lawyerId: req.user._id.toString() })
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      return res.json({ success: true, data: services });
+    } catch (err) {
+      console.error("Error fetching lawyer services:", err);
+      return res
+        .status(500)
+        .json({ success: false, message: "Failed to fetch services" });
     }
-
-    const services = await db
-      .collection("service")
-      .find({ lawyerId: req.user._id.toString() })
-      .sort({ createdAt: -1 })
-      .toArray();
-
-    return res.json({ success: true, data: services });
-  } catch (err) {
-    console.error("Error fetching lawyer services:", err);
-    return res
-      .status(500)
-      .json({ success: false, message: "Failed to fetch services" });
-  }
-});
+  },
+);
 
 // ─── API: Create a Service ─────────────────────────────────────────
 // POST /api/lawyers/services
-app.post("/api/lawyers/services", verifyUser, async (req, res) => {
-  try {
-    if (req.user.role !== "lawyer") {
-      return res.status(403).json({
-        success: false,
-        message: "Forbidden: Only lawyers can create services",
+app.post(
+  "/api/lawyers/services",
+  verifyToken,
+  verifyLawyer,
+  async (req, res) => {
+    try {
+      const { name, description, fee, specialization } = req.body;
+
+      if (!name || !name.trim()) {
+        return res
+          .status(400)
+          .json({ success: false, message: "Service name is required" });
+      }
+
+      const service = {
+        lawyerId: req.user._id.toString(),
+        name: name.trim(),
+        description: (description || "").trim(),
+        fee: Number(fee) || 0,
+        specialization: specialization || "Criminal Law",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      const result = await db.collection("service").insertOne(service);
+
+      return res.status(201).json({
+        success: true,
+        message: "Service created successfully",
+        data: { _id: result.insertedId, ...service },
       });
-    }
-
-    const { name, description, fee, specialization } = req.body;
-
-    if (!name || !name.trim()) {
+    } catch (err) {
+      console.error("Error creating service:", err);
       return res
-        .status(400)
-        .json({ success: false, message: "Service name is required" });
+        .status(500)
+        .json({ success: false, message: "Failed to create service" });
     }
-
-    const service = {
-      lawyerId: req.user._id.toString(),
-      name: name.trim(),
-      description: (description || "").trim(),
-      fee: Number(fee) || 0,
-      specialization: specialization || "Criminal Law",
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
-
-    const result = await db.collection("service").insertOne(service);
-
-    return res.status(201).json({
-      success: true,
-      message: "Service created successfully",
-      data: { _id: result.insertedId, ...service },
-    });
-  } catch (err) {
-    console.error("Error creating service:", err);
-    return res
-      .status(500)
-      .json({ success: false, message: "Failed to create service" });
-  }
-});
+  },
+);
 
 // ─── API: Update a Service ─────────────────────────────────────────
 // PUT /api/lawyers/services/:id
-app.put("/api/lawyers/services/:id", verifyUser, async (req, res) => {
-  try {
-    if (req.user.role !== "lawyer") {
-      return res.status(403).json({
-        success: false,
-        message: "Forbidden: Only lawyers can update services",
+app.put(
+  "/api/lawyers/services/:id",
+  verifyToken,
+  verifyLawyer,
+  async (req, res) => {
+    try {
+      const { name, description, fee, specialization } = req.body;
+      const serviceId = req.params.id;
+
+      const existing = await db.collection("service").findOne({
+        _id: new ObjectId(serviceId),
+        lawyerId: req.user._id.toString(),
       });
-    }
 
-    const { name, description, fee, specialization } = req.body;
-    const serviceId = req.params.id;
+      if (!existing) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Service not found" });
+      }
 
-    const existing = await db.collection("service").findOne({
-      _id: new ObjectId(serviceId),
-      lawyerId: req.user._id.toString(),
-    });
+      const updateFields = { updatedAt: new Date() };
+      if (name !== undefined) updateFields.name = name.trim();
+      if (description !== undefined)
+        updateFields.description = description.trim();
+      if (fee !== undefined) updateFields.fee = Number(fee) || 0;
+      if (specialization !== undefined)
+        updateFields.specialization = specialization;
 
-    if (!existing) {
+      await db
+        .collection("service")
+        .updateOne({ _id: new ObjectId(serviceId) }, { $set: updateFields });
+
+      return res.json({
+        success: true,
+        message: "Service updated successfully",
+      });
+    } catch (err) {
+      console.error("Error updating service:", err);
       return res
-        .status(404)
-        .json({ success: false, message: "Service not found" });
+        .status(500)
+        .json({ success: false, message: "Failed to update service" });
     }
-
-    const updateFields = { updatedAt: new Date() };
-    if (name !== undefined) updateFields.name = name.trim();
-    if (description !== undefined) updateFields.description = description.trim();
-    if (fee !== undefined) updateFields.fee = Number(fee) || 0;
-    if (specialization !== undefined) updateFields.specialization = specialization;
-
-    await db
-      .collection("service")
-      .updateOne(
-        { _id: new ObjectId(serviceId) },
-        { $set: updateFields },
-      );
-
-    return res.json({
-      success: true,
-      message: "Service updated successfully",
-    });
-  } catch (err) {
-    console.error("Error updating service:", err);
-    return res
-      .status(500)
-      .json({ success: false, message: "Failed to update service" });
-  }
-});
+  },
+);
 
 // ─── API: Delete a Service ─────────────────────────────────────────
 // DELETE /api/lawyers/services/:id
-app.delete("/api/lawyers/services/:id", verifyUser, async (req, res) => {
-  try {
-    if (req.user.role !== "lawyer") {
-      return res.status(403).json({
-        success: false,
-        message: "Forbidden: Only lawyers can delete services",
+app.delete(
+  "/api/lawyers/services/:id",
+  verifyToken,
+  verifyLawyer,
+  async (req, res) => {
+    try {
+      const result = await db.collection("service").deleteOne({
+        _id: new ObjectId(req.params.id),
+        lawyerId: req.user._id.toString(),
       });
-    }
 
-    const result = await db.collection("service").deleteOne({
-      _id: new ObjectId(req.params.id),
-      lawyerId: req.user._id.toString(),
-    });
+      if (result.deletedCount === 0) {
+        return res
+          .status(404)
+          .json({ success: false, message: "Service not found" });
+      }
 
-    if (result.deletedCount === 0) {
+      return res.json({
+        success: true,
+        message: "Service deleted successfully",
+      });
+    } catch (err) {
+      console.error("Error deleting service:", err);
       return res
-        .status(404)
-        .json({ success: false, message: "Service not found" });
+        .status(500)
+        .json({ success: false, message: "Failed to delete service" });
     }
-
-    return res.json({
-      success: true,
-      message: "Service deleted successfully",
-    });
-  } catch (err) {
-    console.error("Error deleting service:", err);
-    return res
-      .status(500)
-      .json({ success: false, message: "Failed to delete service" });
-  }
-});
+  },
+);
 
 // ═══════════════════════════════════════════════════════════════════════
 // ADMIN ROUTES
@@ -1437,7 +1427,7 @@ app.delete("/api/lawyers/services/:id", verifyUser, async (req, res) => {
 
 // ─── API: Get All Users (Admin) ──────────────────────────────────────
 // GET /api/admin/users
-app.get("/api/admin/users", verifyUser, verifyAdmin, async (req, res) => {
+app.get("/api/admin/users", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const users = await db
       .collection("user")
@@ -1475,7 +1465,7 @@ app.get("/api/admin/users", verifyUser, verifyAdmin, async (req, res) => {
 // PATCH /api/admin/users/:id/block
 app.patch(
   "/api/admin/users/:id/block",
-  verifyUser,
+  verifyToken,
   verifyAdmin,
   async (req, res) => {
     try {
@@ -1526,7 +1516,7 @@ app.patch(
 // PATCH /api/admin/users/:id/role
 app.patch(
   "/api/admin/users/:id/role",
-  verifyUser,
+  verifyToken,
   verifyAdmin,
   async (req, res) => {
     try {
@@ -1575,7 +1565,7 @@ app.patch(
 // DELETE /api/admin/users/:id
 app.delete(
   "/api/admin/users/:id",
-  verifyUser,
+  verifyToken,
   verifyAdmin,
   async (req, res) => {
     try {
@@ -1618,7 +1608,7 @@ app.delete(
 // GET /api/admin/transactions?status=all|completed|pending|failed
 app.get(
   "/api/admin/transactions",
-  verifyUser,
+  verifyToken,
   verifyAdmin,
   async (req, res) => {
     try {
@@ -1668,8 +1658,7 @@ app.get(
           }
 
           let txnStatus = "pending";
-          if (hiring.status === "paid")
-            txnStatus = "completed";
+          if (hiring.status === "paid") txnStatus = "completed";
           else if (hiring.status === "rejected") txnStatus = "failed";
 
           return {
@@ -1702,11 +1691,13 @@ app.get(
 
 // ─── API: Get Admin Stats (Admin) ────────────────────────────────────
 // GET /api/admin/stats
-app.get("/api/admin/stats", verifyUser, verifyAdmin, async (req, res) => {
+app.get("/api/admin/stats", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const [totalUsers, totalLawyers, totalHires, acceptedHires, paidHires] =
       await Promise.all([
-        db.collection("user").countDocuments({ role: { $in: ["user", "admin"] } }),
+        db
+          .collection("user")
+          .countDocuments({ role: { $in: ["user", "admin"] } }),
         db.collection("user").countDocuments({ role: { $in: ["lawyer"] } }),
         db.collection("hiring").countDocuments({}),
         db.collection("hiring").countDocuments({ status: "accepted" }),
@@ -1742,7 +1733,7 @@ app.get("/api/admin/stats", verifyUser, verifyAdmin, async (req, res) => {
 
 // ─── API: Get Admin Analytics (Admin) ────────────────────────────────
 // GET /api/admin/analytics
-app.get("/api/admin/analytics", verifyUser, verifyAdmin, async (req, res) => {
+app.get("/api/admin/analytics", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const now = new Date();
     const months = [];
@@ -1849,7 +1840,9 @@ async function sendDummyEmail({ to, subject, body }) {
         subject,
         text: body,
       });
-      console.log(`   ✅ Ethereal Preview URL: ${nodemailer.getTestMessageUrl(info)}`);
+      console.log(
+        `   ✅ Ethereal Preview URL: ${nodemailer.getTestMessageUrl(info)}`,
+      );
     } catch (err) {
       console.warn(`   ⚠️  Ethereal send failed: ${err.message}`);
     }
@@ -1858,7 +1851,7 @@ async function sendDummyEmail({ to, subject, body }) {
 
 // ─── API: Shortlist (Client) ───────────────────────────────────────
 // GET /api/shortlist — get user's shortlisted lawyers
-app.get("/api/shortlist", verifyUser, async (req, res) => {
+app.get("/api/shortlist", verifyToken, async (req, res) => {
   try {
     const shortlist = await db
       .collection("shortlist")
@@ -1869,12 +1862,20 @@ app.get("/api/shortlist", verifyUser, async (req, res) => {
     // Enrich with lawyer details
     const lawyers = await Promise.all(
       shortlist.map(async (s) => {
-        const lawyer = await db
-          .collection("user")
-          .findOne(
-            { _id: new ObjectId(s.lawyerId), role: "lawyer" },
-            { projection: { name: 1, image: 1, specialization: 1, hourlyRate: 1, city: 1, location: 1, rating: 1 } },
-          );
+        const lawyer = await db.collection("user").findOne(
+          { _id: new ObjectId(s.lawyerId), role: "lawyer" },
+          {
+            projection: {
+              name: 1,
+              image: 1,
+              specialization: 1,
+              hourlyRate: 1,
+              city: 1,
+              location: 1,
+              rating: 1,
+            },
+          },
+        );
         if (!lawyer) return null;
 
         // Check review stats
@@ -1882,7 +1883,13 @@ app.get("/api/shortlist", verifyUser, async (req, res) => {
           .collection("comment")
           .aggregate([
             { $match: { lawyerId: s.lawyerId } },
-            { $group: { _id: null, avgRating: { $avg: "$rating" }, total: { $sum: 1 } } },
+            {
+              $group: {
+                _id: null,
+                avgRating: { $avg: "$rating" },
+                total: { $sum: 1 },
+              },
+            },
           ])
           .toArray();
 
@@ -1914,7 +1921,7 @@ app.get("/api/shortlist", verifyUser, async (req, res) => {
 });
 
 // POST /api/shortlist — add lawyer to shortlist
-app.post("/api/shortlist", verifyUser, async (req, res) => {
+app.post("/api/shortlist", verifyToken, async (req, res) => {
   try {
     const { lawyerId } = req.body;
     if (!lawyerId) {
@@ -1965,7 +1972,7 @@ app.post("/api/shortlist", verifyUser, async (req, res) => {
 });
 
 // DELETE /api/shortlist/:lawyerId — remove from shortlist
-app.delete("/api/shortlist/:lawyerId", verifyUser, async (req, res) => {
+app.delete("/api/shortlist/:lawyerId", verifyToken, async (req, res) => {
   try {
     const result = await db.collection("shortlist").deleteOne({
       userId: req.user._id.toString(),
@@ -2136,7 +2143,7 @@ app.get("/api/lawyers/:id", async (req, res) => {
 
 // ─── API: Check if lawyer is hired (for detail page) ────────────────
 // GET /api/lawyers/:id/hired-status
-app.get("/api/lawyers/:id/hired-status", verifyUser, async (req, res) => {
+app.get("/api/lawyers/:id/hired-status", verifyToken, async (req, res) => {
   try {
     const hiring = await db.collection("hiring").findOne({
       userId: req.user._id.toString(),
@@ -2155,7 +2162,10 @@ app.get("/api/lawyers/:id/hired-status", verifyUser, async (req, res) => {
       },
     });
   } catch (err) {
-    return res.json({ success: true, data: { isHired: false, isShortlisted: false } });
+    return res.json({
+      success: true,
+      data: { isHired: false, isShortlisted: false },
+    });
   }
 });
 
