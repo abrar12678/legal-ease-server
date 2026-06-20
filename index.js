@@ -1,4 +1,4 @@
-const express = require("express");
+﻿const express = require("express");
 const cors = require("cors");
 const app = express();
 const port = 5000;
@@ -6,13 +6,10 @@ require("dotenv").config();
 
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 
-// ─── Stripe (Option 2: Checkout Sessions — No Webhook) ─────────────
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 
-// ─── Nodemailer (Dummy Transport for Email Notifications) ───────────
 const nodemailer = require("nodemailer");
 
-// Dummy email (lazy init — only when needed, not on cold start)
 let dummyTransporter = null;
 let dummyEmailAccount = null;
 
@@ -29,17 +26,15 @@ async function ensureDummyEmail() {
         pass: dummyEmailAccount.pass,
       },
     });
-    console.log("📧 Dummy Email transport initialized");
+    console.log("ðŸ“§ Dummy Email transport initialized");
   } catch (err) {
-    console.warn("⚠️  Dummy Email transport failed to init:", err.message);
+    console.warn("âš ï¸  Dummy Email transport failed to init:", err.message);
   }
 }
 
-// ─── Middleware ───────────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json());
 
-// ─── MongoDB Connection (cached for Vercel serverless) ────────────────
 let cachedDb = null;
 let cachedClient = null;
 
@@ -57,21 +52,19 @@ async function connectDB() {
     cachedClient = client;
     cachedDb = client.db("legalEase_db");
     await cachedDb.command({ ping: 1 });
-    console.log("✅ Connected to MongoDB — legalEase_db");
+    console.log("âœ… Connected to MongoDB â€” legalEase_db");
     return cachedDb;
   } catch (err) {
-    console.error("❌ MongoDB connection failed:", err);
+    console.error("âŒ MongoDB connection failed:", err);
     throw err;
   }
 }
 
-// Lazy DB getter — ensures connection before every request
 async function getDb() {
   const database = await connectDB();
   return database;
 }
 
-// Global db reference — set by middleware before each request
 let db = null;
 
 app.use(async (req, res, next) => {
@@ -84,11 +77,6 @@ app.use(async (req, res, next) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════
-// TOKEN VERIFICATION (Same pattern as HireLoop)
-// ═══════════════════════════════════════════════════════════════════════
-
-// verification related
 const verifyToken = async (req, res, next) => {
     const authHeader = req.headers?.authorization;
     if (!authHeader) {
@@ -119,18 +107,15 @@ const verifyToken = async (req, res, next) => {
         return res.status(401).send({ message: 'unauthorized access' })
     }
 
-    // Check if user is blocked
     if (user.isBlocked) {
         await db.collection("session").deleteOne({ _id: session._id });
         return res.status(403).send({ message: 'forbidden access: account blocked' })
     }
 
-    // set data in the req object
     req.user = user;
     next();
 }
 
-// must be used after verifyToken middleware
 const verifyLawyer = async (req, res, next) => {
     if (req.user?.role !== 'lawyer') {
         return res.status(403).send({ message: 'forbidden access' })
@@ -138,7 +123,6 @@ const verifyLawyer = async (req, res, next) => {
     next();
 }
 
-// must be used after verifyToken middleware
 const verifyClient = async (req, res, next) => {
     if (req.user?.role !== 'user') {
         return res.status(403).send({ message: 'forbidden access' })
@@ -146,7 +130,6 @@ const verifyClient = async (req, res, next) => {
     next();
 }
 
-// must be used after verifyToken middleware
 const verifyAdmin = async (req, res, next) => {
     if (req.user.role !== 'admin') {
         return res.status(403).send({ message: 'forbidden access' })
@@ -154,12 +137,10 @@ const verifyAdmin = async (req, res, next) => {
     next();
 }
 
-// ─── Health Check ────────────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.send("LegalEase Backend is running!");
 });
 
-// ─── DB Health Check ─────────────────────────────────────────────────
 app.get("/api/health", async (req, res) => {
   try {
     const database = await getDb();
@@ -175,15 +156,9 @@ app.get("/api/health", async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════
-// TEST PRIVATE ROUTES (JWT Verification Testing)
-// ═══════════════════════════════════════════════════════════════════════
-
-// Test 1: Any logged-in user can access
-// Browser: http://localhost:5000/api/test/me
 app.get("/api/test/me", verifyToken, async (req, res) => {
   res.json({
-    message: "✅ Token verified! You are authenticated.",
+    message: "âœ… Token verified! You are authenticated.",
     user: {
       id: req.user._id.toString(),
       name: req.user.name,
@@ -193,11 +168,9 @@ app.get("/api/test/me", verifyToken, async (req, res) => {
   });
 });
 
-// Test 2: Only lawyers can access
-// Browser: http://localhost:5000/api/test/lawyer-only
 app.get("/api/test/lawyer-only", verifyToken, verifyLawyer, async (req, res) => {
   res.json({
-    message: "✅ Lawyer verified! You have lawyer access.",
+    message: "âœ… Lawyer verified! You have lawyer access.",
     user: {
       id: req.user._id.toString(),
       name: req.user.name,
@@ -207,11 +180,9 @@ app.get("/api/test/lawyer-only", verifyToken, verifyLawyer, async (req, res) => 
   });
 });
 
-// Test 3: Only clients (regular users) can access
-// Browser: http://localhost:5000/api/test/client-only
 app.get("/api/test/client-only", verifyToken, verifyClient, async (req, res) => {
   res.json({
-    message: "✅ Client verified! You have client access.",
+    message: "âœ… Client verified! You have client access.",
     user: {
       id: req.user._id.toString(),
       name: req.user.name,
@@ -221,11 +192,9 @@ app.get("/api/test/client-only", verifyToken, verifyClient, async (req, res) => 
   });
 });
 
-// Test 4: Only admins can access
-// Browser: http://localhost:5000/api/test/admin-only
 app.get("/api/test/admin-only", verifyToken, verifyAdmin, async (req, res) => {
   res.json({
-    message: "✅ Admin verified! You have admin access.",
+    message: "âœ… Admin verified! You have admin access.",
     user: {
       id: req.user._id.toString(),
       name: req.user.name,
@@ -235,8 +204,6 @@ app.get("/api/test/admin-only", verifyToken, verifyAdmin, async (req, res) => {
   });
 });
 
-// Test 5: Protected lawyer data (same as /api/lawyers but requires auth)
-// Browser: http://localhost:5000/api/test/protected-lawyers
 app.get("/api/test/protected-lawyers", verifyToken, async (req, res) => {
   try {
     const lawyers = await db
@@ -247,7 +214,7 @@ app.get("/api/test/protected-lawyers", verifyToken, async (req, res) => {
       .toArray();
 
     res.json({
-      message: "✅ Protected data! You must be logged in to see this.",
+      message: "âœ… Protected data! You must be logged in to see this.",
       requestedBy: req.user.name,
       totalShown: lawyers.length,
       lawyers: lawyers.map((l) => ({
@@ -263,12 +230,6 @@ app.get("/api/test/protected-lawyers", verifyToken, async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════
-// PUBLIC ROUTES (No Auth Required)
-// ═══════════════════════════════════════════════════════════════════════
-
-// ─── API: Browse Lawyers (Public) ────────────────────────────────────
-// GET /api/lawyers?search=&specialization=&availability=&minFee=&maxFee=&sort=&page=&limit=
 app.get("/api/lawyers", async (req, res) => {
   try {
     const { search, specialization, availability, minFee, maxFee, sort } =
@@ -415,8 +376,6 @@ app.get("/api/lawyers", async (req, res) => {
       location: l.city || l.location || "N/A",
     }));
 
-    // ── Optional: enrich with isHired & isShortlisted for logged-in users ──
-    // The auth header may be present from apiFetch, try to decode user
     const authHeader = req.headers.authorization;
     if (authHeader && authHeader.startsWith("Bearer ")) {
       try {
@@ -426,7 +385,6 @@ app.get("/api/lawyers", async (req, res) => {
           const userId = session.userId.toString();
           const lawyerIds = lawyers.map((l) => l.id);
 
-          // Check hired (accepted or paid)
           const hirings = await db.collection("hiring").find({
             userId,
             lawyerId: { $in: lawyerIds },
@@ -434,7 +392,6 @@ app.get("/api/lawyers", async (req, res) => {
           }).toArray();
           const hiredSet = new Set(hirings.map((h) => h.lawyerId));
 
-          // Check shortlisted
           const shortlisted = await db.collection("shortlist").find({
             userId,
             lawyerId: { $in: lawyerIds },
@@ -447,7 +404,7 @@ app.get("/api/lawyers", async (req, res) => {
           });
         }
       } catch {
-        // silently ignore — public browsing still works
+
       }
     }
 
@@ -463,8 +420,6 @@ app.get("/api/lawyers", async (req, res) => {
   }
 });
 
-// ─── API: Get Featured Lawyers (Public) ──────────────────────────────
-// GET /api/lawyers/featured
 app.get("/api/lawyers/featured", async (req, res) => {
   try {
     const lawyers = await db
@@ -543,8 +498,6 @@ app.get("/api/lawyers/featured", async (req, res) => {
   }
 });
 
-// ─── API: Get Top Legal Experts (Public) ─────────────────────────────
-// GET /api/lawyers/top-experts
 app.get("/api/lawyers/top-experts", async (req, res) => {
   try {
     const hireCounts = await db
@@ -593,8 +546,6 @@ app.get("/api/lawyers/top-experts", async (req, res) => {
   }
 });
 
-// ─── API: Get Legal Categories with Lawyer Counts (Public) ───────────
-// GET /api/lawyers/categories
 app.get("/api/lawyers/categories", async (req, res) => {
   try {
     const categories = await db
@@ -625,8 +576,6 @@ app.get("/api/lawyers/categories", async (req, res) => {
   }
 });
 
-// ─── API: Get My Hirings (Client) ────────────────────────────────────
-// GET /api/hirings/my-hirings?limit=100
 app.get("/api/hirings/my-hirings", verifyToken, async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 100;
@@ -678,8 +627,6 @@ app.get("/api/hirings/my-hirings", verifyToken, async (req, res) => {
   }
 });
 
-// ─── API: Get Lawyer Requests ────────────────────────────────────────
-// GET /api/hirings/lawyer-requests
 app.get("/api/hirings/lawyer-requests", verifyToken, async (req, res) => {
   try {
     const hirings = await db
@@ -725,8 +672,6 @@ app.get("/api/hirings/lawyer-requests", verifyToken, async (req, res) => {
   }
 });
 
-// ─── API: Create Hiring Request (Client) ────────────────────────────
-// POST /api/hirings
 app.post("/api/hirings", verifyToken, verifyClient, async (req, res) => {
   try {
     const { lawyerId, budget } = req.body;
@@ -771,11 +716,10 @@ app.post("/api/hirings", verifyToken, verifyClient, async (req, res) => {
 
     const result = await db.collection("hiring").insertOne(hiring);
 
-    // ── Dummy Email Notification ──
     sendDummyEmail({
       to: lawyer.email,
       subject: `New Hiring Request from ${req.user.name}`,
-      body: `Hi ${lawyer.name},\n\nYou have received a new hiring request from ${req.user.name} (${req.user.email}).\nBudget: $${hiring.budget}\n\nPlease check your dashboard to accept or reject this request.\n\n— LegalEase Team`,
+      body: `Hi ${lawyer.name},\n\nYou have received a new hiring request from ${req.user.name} (${req.user.email}).\nBudget: $${hiring.budget}\n\nPlease check your dashboard to accept or reject this request.\n\nâ€” LegalEase Team`,
     });
 
     return res.json({
@@ -791,8 +735,6 @@ app.post("/api/hirings", verifyToken, verifyClient, async (req, res) => {
   }
 });
 
-// ─── API: Accept / Reject Hiring Request ─────────────────────────────
-// PATCH /api/hirings/:id/accept   or   PATCH /api/hirings/:id/reject
 app.patch("/api/hirings/:id/:action", verifyToken, verifyLawyer, async (req, res) => {
   try {
 
@@ -823,7 +765,6 @@ app.patch("/api/hirings/:id/:action", verifyToken, verifyLawyer, async (req, res
       });
     }
 
-    // ── Dummy Email Notification ──
     const hiring = await db.collection("hiring").findOne({ _id: new ObjectId(id) });
     if (hiring) {
       const client = await db.collection("user").findOne({ _id: new ObjectId(hiring.userId) });
@@ -832,8 +773,8 @@ app.patch("/api/hirings/:id/:action", verifyToken, verifyLawyer, async (req, res
           to: client.email,
           subject: action === "accept" ? `Hiring Accepted by ${req.user.name}` : `Hiring Update from ${req.user.name}`,
           body: action === "accept"
-            ? `Hi ${client.name},\n\nGreat news! Lawyer ${req.user.name} has accepted your hiring request.\nPlease proceed to payment from your hiring history page.\n\n— LegalEase Team`
-            : `Hi ${client.name},\n\nUnfortunately, lawyer ${req.user.name} has declined your hiring request.\nYou can browse other lawyers and try again.\n\n— LegalEase Team`,
+            ? `Hi ${client.name},\n\nGreat news! Lawyer ${req.user.name} has accepted your hiring request.\nPlease proceed to payment from your hiring history page.\n\nâ€” LegalEase Team`
+            : `Hi ${client.name},\n\nUnfortunately, lawyer ${req.user.name} has declined your hiring request.\nYou can browse other lawyers and try again.\n\nâ€” LegalEase Team`,
         });
       }
     }
@@ -848,12 +789,6 @@ app.patch("/api/hirings/:id/:action", verifyToken, verifyLawyer, async (req, res
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════
-// PAYMENT ROUTES (Stripe Checkout Sessions — No Webhook Needed)
-// ═══════════════════════════════════════════════════════════════════════
-
-// ─── API: Create Stripe Checkout Session ─────────────────────────────
-// POST /api/payments/create-checkout
 app.post("/api/payments/create-checkout", verifyToken, async (req, res) => {
   try {
     const { hiringId } = req.body;
@@ -893,7 +828,7 @@ app.post("/api/payments/create-checkout", verifyToken, async (req, res) => {
       : null;
 
     const lawyerName = lawyer?.name || "Lawyer";
-    const frontendUrl = process.env.FRONTEND_URL || "https://legal-ease-client.vercel.app";
+    const frontendUrl = process.env.FRONTEND_URL || "https:
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
@@ -902,7 +837,7 @@ app.post("/api/payments/create-checkout", verifyToken, async (req, res) => {
           price_data: {
             currency: "usd",
             product_data: {
-              name: `Legal Consultation — ${lawyerName}`,
+              name: `Legal Consultation â€” ${lawyerName}`,
               description: `Hiring ID: ${hiringId}`,
             },
             unit_amount: Math.round(hiring.budget * 100),
@@ -933,8 +868,6 @@ app.post("/api/payments/create-checkout", verifyToken, async (req, res) => {
   }
 });
 
-// ─── API: Verify Payment Status ──────────────────────────────────────
-// GET /api/payments/status/:sessionId
 app.get("/api/payments/status/:sessionId", verifyToken, async (req, res) => {
   try {
     const { sessionId } = req.params;
@@ -959,20 +892,19 @@ app.get("/api/payments/status/:sessionId", verifyToken, async (req, res) => {
           },
         );
 
-        // ── Dummy Email: Payment Confirmation (only on first verification) ──
         if (!wasAlreadyPaid && hiring) {
           const lawyer = await db.collection("user").findOne({ _id: new ObjectId(hiring.lawyerId) });
           if (lawyer) {
             sendDummyEmail({
               to: lawyer.email,
               subject: `Payment Received from ${req.user.name}`,
-              body: `Hi ${lawyer.name},\n\nPayment of $${session.amount_total / 100} has been received from client ${req.user.name} (${req.user.email}).\n\nPlease proceed with the consultation.\n\n— LegalEase Team`,
+              body: `Hi ${lawyer.name},\n\nPayment of $${session.amount_total / 100} has been received from client ${req.user.name} (${req.user.email}).\n\nPlease proceed with the consultation.\n\nâ€” LegalEase Team`,
             });
           }
           sendDummyEmail({
             to: req.user.email,
-            subject: `Payment Confirmation — LegalEase`,
-            body: `Hi ${req.user.name},\n\nYour payment of $${session.amount_total / 100} for the hiring of ${lawyer?.name || "your lawyer"} has been confirmed.\n\nThank you for using LegalEase!\n\n— LegalEase Team`,
+            subject: `Payment Confirmation â€” LegalEase`,
+            body: `Hi ${req.user.name},\n\nYour payment of $${session.amount_total / 100} for the hiring of ${lawyer?.name || "your lawyer"} has been confirmed.\n\nThank you for using LegalEase!\n\nâ€” LegalEase Team`,
           });
         }
       }
@@ -1002,8 +934,6 @@ app.get("/api/payments/status/:sessionId", verifyToken, async (req, res) => {
   }
 });
 
-// ─── API: Get Lawyer Profile ─────────────────────────────────────────
-// GET /api/lawyers/profile
 app.get("/api/lawyers/profile", verifyToken, verifyLawyer, async (req, res) => {
   try {
 
@@ -1070,8 +1000,6 @@ app.get("/api/lawyers/profile", verifyToken, verifyLawyer, async (req, res) => {
   }
 });
 
-// ─── API: Update Lawyer Profile ──────────────────────────────────────
-// PUT /api/lawyers/profile
 app.put("/api/lawyers/profile", verifyToken, verifyLawyer, async (req, res) => {
   try {
 
@@ -1146,8 +1074,6 @@ app.put("/api/lawyers/profile", verifyToken, verifyLawyer, async (req, res) => {
   }
 });
 
-// ─── API: Create Comment / Review (Client) ──────────────────────────
-// POST /api/comments
 app.post("/api/comments", verifyToken, verifyClient, async (req, res) => {
   try {
     const { lawyerId, text, rating } = req.body;
@@ -1165,7 +1091,6 @@ app.post("/api/comments", verifyToken, verifyClient, async (req, res) => {
         .json({ success: false, message: "Invalid lawyer ID" });
     }
 
-    // Check if lawyer exists
     const lawyer = await db.collection("user").findOne({
       _id: new ObjectId(lawyerId),
       role: "lawyer",
@@ -1176,7 +1101,6 @@ app.post("/api/comments", verifyToken, verifyClient, async (req, res) => {
         .json({ success: false, message: "Lawyer not found" });
     }
 
-    // Check if user already commented on this lawyer
     const existing = await db.collection("comment").findOne({
       userId: req.user._id.toString(),
       lawyerId,
@@ -1188,7 +1112,6 @@ app.post("/api/comments", verifyToken, verifyClient, async (req, res) => {
       });
     }
 
-    // Check if user has hired this lawyer (accepted or paid)
     const hiringRecord = await db.collection("hiring").findOne({
       userId: req.user._id.toString(),
       lawyerId,
@@ -1224,8 +1147,6 @@ app.post("/api/comments", verifyToken, verifyClient, async (req, res) => {
   }
 });
 
-// ─── API: Get My Comments ────────────────────────────────────────────
-// GET /api/comments/my-comments
 app.get("/api/comments/my-comments", verifyToken, async (req, res) => {
   try {
     const comments = await db
@@ -1274,8 +1195,6 @@ app.get("/api/comments/my-comments", verifyToken, async (req, res) => {
   }
 });
 
-// ─── API: Update a Comment ───────────────────────────────────────────
-// PUT /api/comments/:id
 app.put("/api/comments/:id", verifyToken, async (req, res) => {
   try {
     const { text, rating } = req.body;
@@ -1302,8 +1221,6 @@ app.put("/api/comments/:id", verifyToken, async (req, res) => {
   }
 });
 
-// ─── API: Delete a Comment ───────────────────────────────────────────
-// DELETE /api/comments/:id
 app.delete("/api/comments/:id", verifyToken, async (req, res) => {
   try {
     const result = await db.collection("comment").deleteOne({
@@ -1326,8 +1243,6 @@ app.delete("/api/comments/:id", verifyToken, async (req, res) => {
   }
 });
 
-// ─── API: Update User Profile (Client) ───────────────────────────────
-// PUT /api/users/update-profile
 app.put("/api/users/update-profile", verifyToken, async (req, res) => {
   try {
     const { name, image } = req.body;
@@ -1370,12 +1285,6 @@ app.put("/api/users/update-profile", verifyToken, async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════
-// LAWYER SERVICES CRUD (Lawyer only)
-// ═══════════════════════════════════════════════════════════════════════
-
-// ─── API: Get Lawyer Services ──────────────────────────────────────
-// GET /api/lawyers/services
 app.get("/api/lawyers/services", verifyToken, verifyLawyer, async (req, res) => {
   try {
     const services = await db
@@ -1393,8 +1302,6 @@ app.get("/api/lawyers/services", verifyToken, verifyLawyer, async (req, res) => 
   }
 });
 
-// ─── API: Create a Service ─────────────────────────────────────────
-// POST /api/lawyers/services
 app.post("/api/lawyers/services", verifyToken, verifyLawyer, async (req, res) => {
   try {
     const { name, description, fee, specialization } = req.body;
@@ -1430,8 +1337,6 @@ app.post("/api/lawyers/services", verifyToken, verifyLawyer, async (req, res) =>
   }
 });
 
-// ─── API: Update a Service ─────────────────────────────────────────
-// PUT /api/lawyers/services/:id
 app.put("/api/lawyers/services/:id", verifyToken, verifyLawyer, async (req, res) => {
   try {
     const { name, description, fee, specialization } = req.body;
@@ -1473,8 +1378,6 @@ app.put("/api/lawyers/services/:id", verifyToken, verifyLawyer, async (req, res)
   }
 });
 
-// ─── API: Delete a Service ─────────────────────────────────────────
-// DELETE /api/lawyers/services/:id
 app.delete("/api/lawyers/services/:id", verifyToken, verifyLawyer, async (req, res) => {
   try {
     const result = await db.collection("service").deleteOne({
@@ -1500,12 +1403,6 @@ app.delete("/api/lawyers/services/:id", verifyToken, verifyLawyer, async (req, r
   }
 });
 
-// ═══════════════════════════════════════════════════════════════════════
-// ADMIN ROUTES
-// ═══════════════════════════════════════════════════════════════════════
-
-// ─── API: Get All Users (Admin) ──────────────────────────────────────
-// GET /api/admin/users
 app.get("/api/admin/users", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const users = await db
@@ -1540,8 +1437,6 @@ app.get("/api/admin/users", verifyToken, verifyAdmin, async (req, res) => {
   }
 });
 
-// ─── API: Block / Unblock User (Admin) ───────────────────────────────
-// PATCH /api/admin/users/:id/block
 app.patch(
   "/api/admin/users/:id/block",
   verifyToken,
@@ -1591,8 +1486,6 @@ app.patch(
   },
 );
 
-// ─── API: Change User Role (Admin) ───────────────────────────────────
-// PATCH /api/admin/users/:id/role
 app.patch(
   "/api/admin/users/:id/role",
   verifyToken,
@@ -1640,8 +1533,6 @@ app.patch(
   },
 );
 
-// ─── API: Delete User (Admin) ────────────────────────────────────────
-// DELETE /api/admin/users/:id
 app.delete(
   "/api/admin/users/:id",
   verifyToken,
@@ -1683,8 +1574,6 @@ app.delete(
   },
 );
 
-// ─── API: Get All Transactions (Admin) ───────────────────────────────
-// GET /api/admin/transactions?status=all|completed|pending|failed
 app.get(
   "/api/admin/transactions",
   verifyToken,
@@ -1701,7 +1590,7 @@ app.get(
         };
         filter.status = statusMap[status] || status;
       } else {
-        // When "all", only show paid + rejected (actual transactions), skip pending/accepted
+
         filter.status = { $in: ["paid", "rejected"] };
       }
 
@@ -1769,8 +1658,6 @@ app.get(
   },
 );
 
-// ─── API: Get Admin Stats (Admin) ────────────────────────────────────
-// GET /api/admin/stats
 app.get("/api/admin/stats", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const [totalUsers, totalLawyers, totalHires, acceptedHires, paidHires] =
@@ -1809,8 +1696,6 @@ app.get("/api/admin/stats", verifyToken, verifyAdmin, async (req, res) => {
   }
 });
 
-// ─── API: Get Admin Analytics (Admin) ────────────────────────────────
-// GET /api/admin/analytics
 app.get("/api/admin/analytics", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const now = new Date();
@@ -1900,16 +1785,14 @@ app.get("/api/admin/analytics", verifyToken, verifyAdmin, async (req, res) => {
   }
 });
 
-// ─── Dummy Email Notification Helper (Nodemailer + Ethereal) ─────
 async function sendDummyEmail({ to, subject, body }) {
-  // Always log to console
-  console.log(`\n📧 DUMMY EMAIL SENT:`);
+
+  console.log(`\nðŸ“§ DUMMY EMAIL SENT:`);
   console.log(`   To: ${to}`);
   console.log(`   Subject: ${subject}`);
   console.log(`   Body: ${body}`);
   console.log(`   Timestamp: ${new Date().toISOString()}\n`);
 
-  // Send via Ethereal (test email service) if transporter is available
   await ensureDummyEmail();
   if (dummyTransporter && dummyEmailAccount) {
     try {
@@ -1919,15 +1802,13 @@ async function sendDummyEmail({ to, subject, body }) {
         subject,
         text: body,
       });
-      console.log(`   ✅ Ethereal Preview URL: ${nodemailer.getTestMessageUrl(info)}`);
+      console.log(`   âœ… Ethereal Preview URL: ${nodemailer.getTestMessageUrl(info)}`);
     } catch (err) {
-      console.warn(`   ⚠️  Ethereal send failed: ${err.message}`);
+      console.warn(`   âš ï¸  Ethereal send failed: ${err.message}`);
     }
   }
 }
 
-// ─── API: Shortlist (Client) ───────────────────────────────────────
-// GET /api/shortlist — get user's shortlisted lawyers
 app.get("/api/shortlist", verifyToken, async (req, res) => {
   try {
     const shortlist = await db
@@ -1936,7 +1817,6 @@ app.get("/api/shortlist", verifyToken, async (req, res) => {
       .sort({ createdAt: -1 })
       .toArray();
 
-    // Enrich with lawyer details
     const lawyers = await Promise.all(
       shortlist.map(async (s) => {
         const lawyer = await db
@@ -1947,7 +1827,6 @@ app.get("/api/shortlist", verifyToken, async (req, res) => {
           );
         if (!lawyer) return null;
 
-        // Check review stats
         const reviewAgg = await db
           .collection("comment")
           .aggregate([
@@ -1983,7 +1862,6 @@ app.get("/api/shortlist", verifyToken, async (req, res) => {
   }
 });
 
-// POST /api/shortlist — add lawyer to shortlist
 app.post("/api/shortlist", verifyToken, async (req, res) => {
   try {
     const { lawyerId } = req.body;
@@ -2034,7 +1912,6 @@ app.post("/api/shortlist", verifyToken, async (req, res) => {
   }
 });
 
-// DELETE /api/shortlist/:lawyerId — remove from shortlist
 app.delete("/api/shortlist/:lawyerId", verifyToken, async (req, res) => {
   try {
     const result = await db.collection("shortlist").deleteOne({
@@ -2061,9 +1938,6 @@ app.delete("/api/shortlist/:lawyerId", verifyToken, async (req, res) => {
   }
 });
 
-// ─── API: Get Lawyer Details (Public) ────────────────────────────────
-// GET /api/lawyers/:id
-// Returns lawyer profile, review stats, total hires, and comments
 app.get("/api/lawyers/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -2074,7 +1948,6 @@ app.get("/api/lawyers/:id", async (req, res) => {
         .json({ success: false, message: "Invalid lawyer ID" });
     }
 
-    // Fetch lawyer profile
     const lawyer = await db.collection("user").findOne(
       { _id: new ObjectId(id), role: "lawyer" },
       {
@@ -2104,7 +1977,6 @@ app.get("/api/lawyers/:id", async (req, res) => {
         .json({ success: false, message: "Lawyer not found" });
     }
 
-    // Get review stats
     const reviewStats = await db
       .collection("comment")
       .aggregate([
@@ -2119,13 +1991,11 @@ app.get("/api/lawyers/:id", async (req, res) => {
       ])
       .toArray();
 
-    // Get total hires count (accepted only)
     const totalHires = await db.collection("hiring").countDocuments({
       lawyerId: id,
       status: "accepted",
     });
 
-    // Get comments with commenter names
     const comments = await db
       .collection("comment")
       .find({ lawyerId: id })
@@ -2150,7 +2020,7 @@ app.get("/api/lawyers/:id", async (req, res) => {
               userImage = commenter.image || null;
             }
           } catch {
-            // invalid userId, skip
+
           }
         }
 
@@ -2204,8 +2074,6 @@ app.get("/api/lawyers/:id", async (req, res) => {
   }
 });
 
-// ─── API: Check if lawyer is hired (for detail page) ────────────────
-// GET /api/lawyers/:id/hired-status
 app.get("/api/lawyers/:id/hired-status", verifyToken, async (req, res) => {
   try {
     const hiring = await db.collection("hiring").findOne({
@@ -2229,9 +2097,10 @@ app.get("/api/lawyers/:id/hired-status", verifyToken, async (req, res) => {
   }
 });
 
-// ─── Start Server ────────────────────────────────────────────────────
 app.listen(port, () => {
-  console.log(`🚀 LegalEase backend running on port ${port}`);
+  console.log(`ðŸš€ LegalEase backend running on port ${port}`);
 });
 
 module.exports = app;
+
+
