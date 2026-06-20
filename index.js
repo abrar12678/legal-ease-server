@@ -12,11 +12,12 @@ const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 // ─── Nodemailer (Dummy Transport for Email Notifications) ───────────
 const nodemailer = require("nodemailer");
 
-// Create a test account (ethereal.email) for dummy email transport
+// Dummy email (lazy init — only when needed, not on cold start)
 let dummyTransporter = null;
 let dummyEmailAccount = null;
 
-async function initDummyEmail() {
+async function ensureDummyEmail() {
+  if (dummyTransporter) return;
   try {
     dummyEmailAccount = await nodemailer.createTestAccount();
     dummyTransporter = nodemailer.createTransport({
@@ -30,41 +31,58 @@ async function initDummyEmail() {
     });
     console.log("📧 Dummy Email transport initialized");
   } catch (err) {
-    console.warn(
-      "⚠️  Dummy Email transport failed to init, falling back to console logging:",
-      err.message,
-    );
+    console.warn("⚠️  Dummy Email transport failed to init:", err.message);
   }
 }
-initDummyEmail();
 
 // ─── Middleware ───────────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json());
 
-// ─── MongoDB Connection (persistent) ─────────────────────────────────
-const client = new MongoClient(process.env.MONGODB_URI, {
-  serverApi: {
-    version: ServerApiVersion.v1,
-    strict: true,
-    deprecationErrors: true,
-  },
-});
-
-let db;
+// ─── MongoDB Connection (cached for Vercel serverless) ────────────────
+let cachedDb = null;
+let cachedClient = null;
 
 async function connectDB() {
+  if (cachedDb) return cachedDb;
   try {
+    const client = new MongoClient(process.env.MONGODB_URI, {
+      serverApi: {
+        version: ServerApiVersion.v1,
+        strict: true,
+        deprecationErrors: true,
+      },
+    });
     await client.connect();
-    db = client.db("legalEase_db");
-    await db.command({ ping: 1 });
+    cachedClient = client;
+    cachedDb = client.db("legalEase_db");
+    await cachedDb.command({ ping: 1 });
     console.log("✅ Connected to MongoDB — legalEase_db");
+    return cachedDb;
   } catch (err) {
     console.error("❌ MongoDB connection failed:", err);
-    process.exit(1);
+    throw err;
   }
 }
-connectDB();
+
+// Lazy DB getter — ensures connection before every request
+async function getDb() {
+  const database = await connectDB();
+  return database;
+}
+
+// Global db reference — set by middleware before each request
+let db = null;
+
+app.use(async (req, res, next) => {
+  try {
+    if (!db) db = await getDb();
+    next();
+  } catch (err) {
+    console.error("DB middleware error:", err.message);
+    res.status(500).json({ success: false, message: "Database connection failed" });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════════════
 // TOKEN VERIFICATION (Same pattern as HireLoop)
@@ -72,75 +90,177 @@ connectDB();
 
 // verification related
 const verifyToken = async (req, res, next) => {
-  const authHeader = req.headers?.authorization;
-  if (!authHeader) {
-    return res.status(401).send({ message: "unauthorized access" });
-  }
+    const authHeader = req.headers?.authorization;
+    if (!authHeader) {
+        return res.status(401).send({ message: 'unauthorized access' })
+    }
 
-  const token = authHeader.split(" ")[1];
+    const token = authHeader.split(' ')[1]
 
-  if (!token) {
-    return res.status(401).send({ message: "unauthorized access" });
-  }
+    if (!token) {
+        return res.status(401).send({ message: 'unauthorized access' })
+    }
 
-  const query = { token: token };
-  const session = await db.collection("session").findOne(query);
+    const query = { token: token }
+    const session = await db.collection("session").findOne(query);
 
-  if (!session) {
-    return res.status(401).send({ message: "unauthorized access" });
-  }
+    if (!session) {
+        return res.status(401).send({ message: 'unauthorized access' })
+    }
 
-  const userId = session.userId;
+    const userId = session.userId;
 
-  const userQuery = {
-    _id: userId,
-  };
+    const userQuery = {
+        _id: userId
+    }
 
-  const user = await db.collection("user").findOne(userQuery);
-  if (!user) {
-    return res.status(401).send({ message: "unauthorized access" });
-  }
+    const user = await db.collection("user").findOne(userQuery);
+    if (!user) {
+        return res.status(401).send({ message: 'unauthorized access' })
+    }
 
-  // Check if user is blocked
-  if (user.isBlocked) {
-    await db.collection("session").deleteOne({ _id: session._id });
-    return res
-      .status(403)
-      .send({ message: "forbidden access: account blocked" });
-  }
+    // Check if user is blocked
+    if (user.isBlocked) {
+        await db.collection("session").deleteOne({ _id: session._id });
+        return res.status(403).send({ message: 'forbidden access: account blocked' })
+    }
 
-  // set data in the req object
-  req.user = user;
-  next();
-};
+    // set data in the req object
+    req.user = user;
+    next();
+}
 
 // must be used after verifyToken middleware
 const verifyLawyer = async (req, res, next) => {
-  if (req.user?.role !== "lawyer") {
-    return res.status(403).send({ message: "forbidden access" });
-  }
-  next();
-};
+    if (req.user?.role !== 'lawyer') {
+        return res.status(403).send({ message: 'forbidden access' })
+    }
+    next();
+}
 
 // must be used after verifyToken middleware
 const verifyClient = async (req, res, next) => {
-  if (req.user?.role !== "user") {
-    return res.status(403).send({ message: "forbidden access" });
-  }
-  next();
-};
+    if (req.user?.role !== 'user') {
+        return res.status(403).send({ message: 'forbidden access' })
+    }
+    next();
+}
 
 // must be used after verifyToken middleware
 const verifyAdmin = async (req, res, next) => {
-  if (req.user.role !== "admin") {
-    return res.status(403).send({ message: "forbidden access" });
-  }
-  next();
-};
+    if (req.user.role !== 'admin') {
+        return res.status(403).send({ message: 'forbidden access' })
+    }
+    next();
+}
 
 // ─── Health Check ────────────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.send("LegalEase Backend is running!");
+});
+
+// ─── DB Health Check ─────────────────────────────────────────────────
+app.get("/api/health", async (req, res) => {
+  try {
+    const database = await getDb();
+    const result = await database.command({ ping: 1 });
+    const collections = await database.listCollections().toArray();
+    res.json({
+      status: "ok",
+      db: "connected",
+      collections: collections.map((c) => c.name),
+    });
+  } catch (err) {
+    res.status(500).json({ status: "error", message: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// TEST PRIVATE ROUTES (JWT Verification Testing)
+// ═══════════════════════════════════════════════════════════════════════
+
+// Test 1: Any logged-in user can access
+// Browser: http://localhost:5000/api/test/me
+app.get("/api/test/me", verifyToken, async (req, res) => {
+  res.json({
+    message: "✅ Token verified! You are authenticated.",
+    user: {
+      id: req.user._id.toString(),
+      name: req.user.name,
+      email: req.user.email,
+      role: req.user.role,
+    },
+  });
+});
+
+// Test 2: Only lawyers can access
+// Browser: http://localhost:5000/api/test/lawyer-only
+app.get("/api/test/lawyer-only", verifyToken, verifyLawyer, async (req, res) => {
+  res.json({
+    message: "✅ Lawyer verified! You have lawyer access.",
+    user: {
+      id: req.user._id.toString(),
+      name: req.user.name,
+      email: req.user.email,
+      role: req.user.role,
+    },
+  });
+});
+
+// Test 3: Only clients (regular users) can access
+// Browser: http://localhost:5000/api/test/client-only
+app.get("/api/test/client-only", verifyToken, verifyClient, async (req, res) => {
+  res.json({
+    message: "✅ Client verified! You have client access.",
+    user: {
+      id: req.user._id.toString(),
+      name: req.user.name,
+      email: req.user.email,
+      role: req.user.role,
+    },
+  });
+});
+
+// Test 4: Only admins can access
+// Browser: http://localhost:5000/api/test/admin-only
+app.get("/api/test/admin-only", verifyToken, verifyAdmin, async (req, res) => {
+  res.json({
+    message: "✅ Admin verified! You have admin access.",
+    user: {
+      id: req.user._id.toString(),
+      name: req.user.name,
+      email: req.user.email,
+      role: req.user.role,
+    },
+  });
+});
+
+// Test 5: Protected lawyer data (same as /api/lawyers but requires auth)
+// Browser: http://localhost:5000/api/test/protected-lawyers
+app.get("/api/test/protected-lawyers", verifyToken, async (req, res) => {
+  try {
+    const lawyers = await db
+      .collection("user")
+      .find({ role: "lawyer" })
+      .project({ name: 1, specialization: 1, hourlyRate: 1, city: 1 })
+      .limit(5)
+      .toArray();
+
+    res.json({
+      message: "✅ Protected data! You must be logged in to see this.",
+      requestedBy: req.user.name,
+      totalShown: lawyers.length,
+      lawyers: lawyers.map((l) => ({
+        id: l._id.toString(),
+        name: l.name,
+        specialization: l.specialization,
+        hourlyRate: l.hourlyRate,
+        city: l.city,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to fetch lawyers" });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -289,9 +409,10 @@ app.get("/api/lawyers", async (req, res) => {
     const lawyers = (batch.lawyers || []).map((l) => ({
       ...l,
       id: l.id.toString(),
+      specialization: l.specialization || "N/A",
       rating: Number(l.rating) || 0,
       hourlyRate: l.hourlyRate || 0,
-      location: l.city || l.location || "",
+      location: l.city || l.location || "N/A",
     }));
 
     // ── Optional: enrich with isHired & isShortlisted for logged-in users ──
@@ -301,32 +422,23 @@ app.get("/api/lawyers", async (req, res) => {
       try {
         const token = authHeader.split(" ")[1];
         const session = await db.collection("session").findOne({ token });
-        if (
-          (session && !session.expiresAt) ||
-          new Date(session.expiresAt) >= new Date()
-        ) {
+        if (session && !session.expiresAt || new Date(session.expiresAt) >= new Date()) {
           const userId = session.userId.toString();
           const lawyerIds = lawyers.map((l) => l.id);
 
           // Check hired (accepted or paid)
-          const hirings = await db
-            .collection("hiring")
-            .find({
-              userId,
-              lawyerId: { $in: lawyerIds },
-              status: { $in: ["accepted", "paid"] },
-            })
-            .toArray();
+          const hirings = await db.collection("hiring").find({
+            userId,
+            lawyerId: { $in: lawyerIds },
+            status: { $in: ["accepted", "paid"] },
+          }).toArray();
           const hiredSet = new Set(hirings.map((h) => h.lawyerId));
 
           // Check shortlisted
-          const shortlisted = await db
-            .collection("shortlist")
-            .find({
-              userId,
-              lawyerId: { $in: lawyerIds },
-            })
-            .toArray();
+          const shortlisted = await db.collection("shortlist").find({
+            userId,
+            lawyerId: { $in: lawyerIds },
+          }).toArray();
           const shortlistSet = new Set(shortlisted.map((s) => s.lawyerId));
 
           lawyers.forEach((l) => {
@@ -403,10 +515,10 @@ app.get("/api/lawyers/featured", async (req, res) => {
       _id: l._id.toString(),
       name: l.name,
       image: l.image,
-      specialization: l.specialization,
+      specialization: l.specialization || "N/A",
       hourlyRate: l.hourlyRate || 0,
       experience: l.experience || 0,
-      city: l.city || l.location || "",
+      city: l.city || l.location || "N/A",
       location: l.location || "",
       isAvailable: l.isAvailable !== false,
       bio: l.bio,
@@ -681,72 +793,60 @@ app.post("/api/hirings", verifyToken, verifyClient, async (req, res) => {
 
 // ─── API: Accept / Reject Hiring Request ─────────────────────────────
 // PATCH /api/hirings/:id/accept   or   PATCH /api/hirings/:id/reject
-app.patch(
-  "/api/hirings/:id/:action",
-  verifyToken,
-  verifyLawyer,
-  async (req, res) => {
-    try {
-      const { id, action } = req.params;
+app.patch("/api/hirings/:id/:action", verifyToken, verifyLawyer, async (req, res) => {
+  try {
 
-      if (action !== "accept" && action !== "reject") {
-        return res.status(400).json({
-          success: false,
-          message: "Invalid action. Use 'accept' or 'reject'.",
-        });
-      }
+    const { id, action } = req.params;
 
-      const newStatus = action === "accept" ? "accepted" : "rejected";
-
-      const result = await db.collection("hiring").updateOne(
-        {
-          _id: new ObjectId(id),
-          lawyerId: req.user._id.toString(),
-          status: "pending",
-        },
-        { $set: { status: newStatus, updatedAt: new Date() } },
-      );
-
-      if (result.matchedCount === 0) {
-        return res.status(404).json({
-          success: false,
-          message: "Request not found or already acted on",
-        });
-      }
-
-      // ── Dummy Email Notification ──
-      const hiring = await db
-        .collection("hiring")
-        .findOne({ _id: new ObjectId(id) });
-      if (hiring) {
-        const client = await db
-          .collection("user")
-          .findOne({ _id: new ObjectId(hiring.userId) });
-        if (client) {
-          sendDummyEmail({
-            to: client.email,
-            subject:
-              action === "accept"
-                ? `Hiring Accepted by ${req.user.name}`
-                : `Hiring Update from ${req.user.name}`,
-            body:
-              action === "accept"
-                ? `Hi ${client.name},\n\nGreat news! Lawyer ${req.user.name} has accepted your hiring request.\nPlease proceed to payment from your hiring history page.\n\n— LegalEase Team`
-                : `Hi ${client.name},\n\nUnfortunately, lawyer ${req.user.name} has declined your hiring request.\nYou can browse other lawyers and try again.\n\n— LegalEase Team`,
-          });
-        }
-      }
-
-      return res.json({ success: true, message: `Request ${newStatus}` });
-    } catch (err) {
-      console.error(`Error ${req.params.action}ing request:`, err);
-      return res.status(500).json({
+    if (action !== "accept" && action !== "reject") {
+      return res.status(400).json({
         success: false,
-        message: `Failed to ${req.params.action} request`,
+        message: "Invalid action. Use 'accept' or 'reject'.",
       });
     }
-  },
-);
+
+    const newStatus = action === "accept" ? "accepted" : "rejected";
+
+    const result = await db.collection("hiring").updateOne(
+      {
+        _id: new ObjectId(id),
+        lawyerId: req.user._id.toString(),
+        status: "pending",
+      },
+      { $set: { status: newStatus, updatedAt: new Date() } },
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Request not found or already acted on",
+      });
+    }
+
+    // ── Dummy Email Notification ──
+    const hiring = await db.collection("hiring").findOne({ _id: new ObjectId(id) });
+    if (hiring) {
+      const client = await db.collection("user").findOne({ _id: new ObjectId(hiring.userId) });
+      if (client) {
+        sendDummyEmail({
+          to: client.email,
+          subject: action === "accept" ? `Hiring Accepted by ${req.user.name}` : `Hiring Update from ${req.user.name}`,
+          body: action === "accept"
+            ? `Hi ${client.name},\n\nGreat news! Lawyer ${req.user.name} has accepted your hiring request.\nPlease proceed to payment from your hiring history page.\n\n— LegalEase Team`
+            : `Hi ${client.name},\n\nUnfortunately, lawyer ${req.user.name} has declined your hiring request.\nYou can browse other lawyers and try again.\n\n— LegalEase Team`,
+        });
+      }
+    }
+
+    return res.json({ success: true, message: `Request ${newStatus}` });
+  } catch (err) {
+    console.error(`Error ${req.params.action}ing request:`, err);
+    return res.status(500).json({
+      success: false,
+      message: `Failed to ${req.params.action} request`,
+    });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════════════
 // PAYMENT ROUTES (Stripe Checkout Sessions — No Webhook Needed)
@@ -793,7 +893,7 @@ app.post("/api/payments/create-checkout", verifyToken, async (req, res) => {
       : null;
 
     const lawyerName = lawyer?.name || "Lawyer";
-    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
+    const frontendUrl = process.env.FRONTEND_URL || "https://legal-ease-client.vercel.app";
 
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ["card"],
@@ -844,9 +944,7 @@ app.get("/api/payments/status/:sessionId", verifyToken, async (req, res) => {
     if (session.payment_status === "paid") {
       const hiringId = session.metadata?.hiringId;
       if (hiringId) {
-        const hiring = await db
-          .collection("hiring")
-          .findOne({ _id: new ObjectId(hiringId) });
+        const hiring = await db.collection("hiring").findOne({ _id: new ObjectId(hiringId) });
         const wasAlreadyPaid = hiring && hiring.status === "paid";
 
         await db.collection("hiring").updateOne(
@@ -863,9 +961,7 @@ app.get("/api/payments/status/:sessionId", verifyToken, async (req, res) => {
 
         // ── Dummy Email: Payment Confirmation (only on first verification) ──
         if (!wasAlreadyPaid && hiring) {
-          const lawyer = await db
-            .collection("user")
-            .findOne({ _id: new ObjectId(hiring.lawyerId) });
+          const lawyer = await db.collection("user").findOne({ _id: new ObjectId(hiring.lawyerId) });
           if (lawyer) {
             sendDummyEmail({
               to: lawyer.email,
@@ -910,6 +1006,7 @@ app.get("/api/payments/status/:sessionId", verifyToken, async (req, res) => {
 // GET /api/lawyers/profile
 app.get("/api/lawyers/profile", verifyToken, verifyLawyer, async (req, res) => {
   try {
+
     const user = await db.collection("user").findOne(
       { _id: req.user._id },
       {
@@ -977,6 +1074,7 @@ app.get("/api/lawyers/profile", verifyToken, verifyLawyer, async (req, res) => {
 // PUT /api/lawyers/profile
 app.put("/api/lawyers/profile", verifyToken, verifyLawyer, async (req, res) => {
   try {
+
     const {
       name,
       image,
@@ -1278,148 +1376,129 @@ app.put("/api/users/update-profile", verifyToken, async (req, res) => {
 
 // ─── API: Get Lawyer Services ──────────────────────────────────────
 // GET /api/lawyers/services
-app.get(
-  "/api/lawyers/services",
-  verifyToken,
-  verifyLawyer,
-  async (req, res) => {
-    try {
-      const services = await db
-        .collection("service")
-        .find({ lawyerId: req.user._id.toString() })
-        .sort({ createdAt: -1 })
-        .toArray();
+app.get("/api/lawyers/services", verifyToken, verifyLawyer, async (req, res) => {
+  try {
+    const services = await db
+      .collection("service")
+      .find({ lawyerId: req.user._id.toString() })
+      .sort({ createdAt: -1 })
+      .toArray();
 
-      return res.json({ success: true, data: services });
-    } catch (err) {
-      console.error("Error fetching lawyer services:", err);
-      return res
-        .status(500)
-        .json({ success: false, message: "Failed to fetch services" });
-    }
-  },
-);
+    return res.json({ success: true, data: services });
+  } catch (err) {
+    console.error("Error fetching lawyer services:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to fetch services" });
+  }
+});
 
 // ─── API: Create a Service ─────────────────────────────────────────
 // POST /api/lawyers/services
-app.post(
-  "/api/lawyers/services",
-  verifyToken,
-  verifyLawyer,
-  async (req, res) => {
-    try {
-      const { name, description, fee, specialization } = req.body;
+app.post("/api/lawyers/services", verifyToken, verifyLawyer, async (req, res) => {
+  try {
+    const { name, description, fee, specialization } = req.body;
 
-      if (!name || !name.trim()) {
-        return res
-          .status(400)
-          .json({ success: false, message: "Service name is required" });
-      }
-
-      const service = {
-        lawyerId: req.user._id.toString(),
-        name: name.trim(),
-        description: (description || "").trim(),
-        fee: Number(fee) || 0,
-        specialization: specialization || "Criminal Law",
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-
-      const result = await db.collection("service").insertOne(service);
-
-      return res.status(201).json({
-        success: true,
-        message: "Service created successfully",
-        data: { _id: result.insertedId, ...service },
-      });
-    } catch (err) {
-      console.error("Error creating service:", err);
+    if (!name || !name.trim()) {
       return res
-        .status(500)
-        .json({ success: false, message: "Failed to create service" });
+        .status(400)
+        .json({ success: false, message: "Service name is required" });
     }
-  },
-);
+
+    const service = {
+      lawyerId: req.user._id.toString(),
+      name: name.trim(),
+      description: (description || "").trim(),
+      fee: Number(fee) || 0,
+      specialization: specialization || "Criminal Law",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await db.collection("service").insertOne(service);
+
+    return res.status(201).json({
+      success: true,
+      message: "Service created successfully",
+      data: { _id: result.insertedId, ...service },
+    });
+  } catch (err) {
+    console.error("Error creating service:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to create service" });
+  }
+});
 
 // ─── API: Update a Service ─────────────────────────────────────────
 // PUT /api/lawyers/services/:id
-app.put(
-  "/api/lawyers/services/:id",
-  verifyToken,
-  verifyLawyer,
-  async (req, res) => {
-    try {
-      const { name, description, fee, specialization } = req.body;
-      const serviceId = req.params.id;
+app.put("/api/lawyers/services/:id", verifyToken, verifyLawyer, async (req, res) => {
+  try {
+    const { name, description, fee, specialization } = req.body;
+    const serviceId = req.params.id;
 
-      const existing = await db.collection("service").findOne({
-        _id: new ObjectId(serviceId),
-        lawyerId: req.user._id.toString(),
-      });
+    const existing = await db.collection("service").findOne({
+      _id: new ObjectId(serviceId),
+      lawyerId: req.user._id.toString(),
+    });
 
-      if (!existing) {
-        return res
-          .status(404)
-          .json({ success: false, message: "Service not found" });
-      }
-
-      const updateFields = { updatedAt: new Date() };
-      if (name !== undefined) updateFields.name = name.trim();
-      if (description !== undefined)
-        updateFields.description = description.trim();
-      if (fee !== undefined) updateFields.fee = Number(fee) || 0;
-      if (specialization !== undefined)
-        updateFields.specialization = specialization;
-
-      await db
-        .collection("service")
-        .updateOne({ _id: new ObjectId(serviceId) }, { $set: updateFields });
-
-      return res.json({
-        success: true,
-        message: "Service updated successfully",
-      });
-    } catch (err) {
-      console.error("Error updating service:", err);
+    if (!existing) {
       return res
-        .status(500)
-        .json({ success: false, message: "Failed to update service" });
+        .status(404)
+        .json({ success: false, message: "Service not found" });
     }
-  },
-);
+
+    const updateFields = { updatedAt: new Date() };
+    if (name !== undefined) updateFields.name = name.trim();
+    if (description !== undefined) updateFields.description = description.trim();
+    if (fee !== undefined) updateFields.fee = Number(fee) || 0;
+    if (specialization !== undefined) updateFields.specialization = specialization;
+
+    await db
+      .collection("service")
+      .updateOne(
+        { _id: new ObjectId(serviceId) },
+        { $set: updateFields },
+      );
+
+    return res.json({
+      success: true,
+      message: "Service updated successfully",
+    });
+  } catch (err) {
+    console.error("Error updating service:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to update service" });
+  }
+});
 
 // ─── API: Delete a Service ─────────────────────────────────────────
 // DELETE /api/lawyers/services/:id
-app.delete(
-  "/api/lawyers/services/:id",
-  verifyToken,
-  verifyLawyer,
-  async (req, res) => {
-    try {
-      const result = await db.collection("service").deleteOne({
-        _id: new ObjectId(req.params.id),
-        lawyerId: req.user._id.toString(),
-      });
+app.delete("/api/lawyers/services/:id", verifyToken, verifyLawyer, async (req, res) => {
+  try {
+    const result = await db.collection("service").deleteOne({
+      _id: new ObjectId(req.params.id),
+      lawyerId: req.user._id.toString(),
+    });
 
-      if (result.deletedCount === 0) {
-        return res
-          .status(404)
-          .json({ success: false, message: "Service not found" });
-      }
-
-      return res.json({
-        success: true,
-        message: "Service deleted successfully",
-      });
-    } catch (err) {
-      console.error("Error deleting service:", err);
+    if (result.deletedCount === 0) {
       return res
-        .status(500)
-        .json({ success: false, message: "Failed to delete service" });
+        .status(404)
+        .json({ success: false, message: "Service not found" });
     }
-  },
-);
+
+    return res.json({
+      success: true,
+      message: "Service deleted successfully",
+    });
+  } catch (err) {
+    console.error("Error deleting service:", err);
+    return res
+      .status(500)
+      .json({ success: false, message: "Failed to delete service" });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════════════
 // ADMIN ROUTES
@@ -1658,7 +1737,8 @@ app.get(
           }
 
           let txnStatus = "pending";
-          if (hiring.status === "paid") txnStatus = "completed";
+          if (hiring.status === "paid")
+            txnStatus = "completed";
           else if (hiring.status === "rejected") txnStatus = "failed";
 
           return {
@@ -1695,9 +1775,7 @@ app.get("/api/admin/stats", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const [totalUsers, totalLawyers, totalHires, acceptedHires, paidHires] =
       await Promise.all([
-        db
-          .collection("user")
-          .countDocuments({ role: { $in: ["user", "admin"] } }),
+        db.collection("user").countDocuments({ role: { $in: ["user", "admin"] } }),
         db.collection("user").countDocuments({ role: { $in: ["lawyer"] } }),
         db.collection("hiring").countDocuments({}),
         db.collection("hiring").countDocuments({ status: "accepted" }),
@@ -1832,6 +1910,7 @@ async function sendDummyEmail({ to, subject, body }) {
   console.log(`   Timestamp: ${new Date().toISOString()}\n`);
 
   // Send via Ethereal (test email service) if transporter is available
+  await ensureDummyEmail();
   if (dummyTransporter && dummyEmailAccount) {
     try {
       const info = await dummyTransporter.sendMail({
@@ -1840,9 +1919,7 @@ async function sendDummyEmail({ to, subject, body }) {
         subject,
         text: body,
       });
-      console.log(
-        `   ✅ Ethereal Preview URL: ${nodemailer.getTestMessageUrl(info)}`,
-      );
+      console.log(`   ✅ Ethereal Preview URL: ${nodemailer.getTestMessageUrl(info)}`);
     } catch (err) {
       console.warn(`   ⚠️  Ethereal send failed: ${err.message}`);
     }
@@ -1862,20 +1939,12 @@ app.get("/api/shortlist", verifyToken, async (req, res) => {
     // Enrich with lawyer details
     const lawyers = await Promise.all(
       shortlist.map(async (s) => {
-        const lawyer = await db.collection("user").findOne(
-          { _id: new ObjectId(s.lawyerId), role: "lawyer" },
-          {
-            projection: {
-              name: 1,
-              image: 1,
-              specialization: 1,
-              hourlyRate: 1,
-              city: 1,
-              location: 1,
-              rating: 1,
-            },
-          },
-        );
+        const lawyer = await db
+          .collection("user")
+          .findOne(
+            { _id: new ObjectId(s.lawyerId), role: "lawyer" },
+            { projection: { name: 1, image: 1, specialization: 1, hourlyRate: 1, city: 1, location: 1, rating: 1 } },
+          );
         if (!lawyer) return null;
 
         // Check review stats
@@ -1883,13 +1952,7 @@ app.get("/api/shortlist", verifyToken, async (req, res) => {
           .collection("comment")
           .aggregate([
             { $match: { lawyerId: s.lawyerId } },
-            {
-              $group: {
-                _id: null,
-                avgRating: { $avg: "$rating" },
-                total: { $sum: 1 },
-              },
-            },
+            { $group: { _id: null, avgRating: { $avg: "$rating" }, total: { $sum: 1 } } },
           ])
           .toArray();
 
@@ -2162,10 +2225,7 @@ app.get("/api/lawyers/:id/hired-status", verifyToken, async (req, res) => {
       },
     });
   } catch (err) {
-    return res.json({
-      success: true,
-      data: { isHired: false, isShortlisted: false },
-    });
+    return res.json({ success: true, data: { isHired: false, isShortlisted: false } });
   }
 });
 
